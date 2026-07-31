@@ -131,9 +131,8 @@ go build -o aeyo-cart-relay .
 ./aeyo-cart-relay
 ```
 
-Listens on `:8080`. Set `AEYO_DB_PATH` to choose where the SQLite file lives (default
-`./aeyo.db`). It is meant to sit behind a reverse proxy that terminates TLS and forwards
-`/api/*` and `/ws/*`.
+Listens on `:8080`. It is meant to sit behind a reverse proxy that terminates TLS and
+forwards `/api/*` and `/ws/*`.
 
 ```bash
 go test ./...
@@ -141,6 +140,19 @@ go test ./...
 
 Go 1.22+. The SQLite driver is pure Go, so there is no CGO and no C toolchain required, and
 the resulting binary is static.
+
+### Configuration
+
+Every environment variable the binary reads. This list is the contract: the process that
+runs it sets the values, and this file is the only place that says what they mean.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AEYO_DB_PATH` | `./aeyo.db` | Where the SQLite file lives. The directory must exist and be writable. |
+| `AEYO_PREMIUM_FOR_ALL` | unset | When `true`, every cart owner is treated as premium: the join capacity check is bypassed and every member is reported as premium. Used during the public beta so testers can share without limits. Unset it to reinstate per-tier limits. |
+
+There are no others, and there are **no secrets here** — nothing this server does requires
+a credential, so none is read, stored, or needed to run it.
 
 ---
 
