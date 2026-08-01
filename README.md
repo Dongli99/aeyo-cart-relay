@@ -39,9 +39,13 @@ in **Apple's CloudKit, not here**, and there is no code in this repository that 
 it. If you came to verify that claim, this is the wrong repository and we would rather say
 so than let you leave with a false impression that you checked it.
 
-**4. This is not accepting contributions.** Issues and pull requests are closed. This is a
-published-for-inspection mirror of an internal repository, not a community project. It is
-here to be read, not to be developed.
+**4. This is not accepting contributions.** Issues are disabled. Pull requests cannot be
+turned off on a public GitHub repository, so they stay technically possible — they will be
+closed unread, and that is not meant unkindly. This is a published-for-inspection mirror of
+an internal repository, not a community project. It is here to be read, not to be developed.
+
+If you find something genuinely wrong — a security problem, or a claim in this file that
+the code does not support — that is worth hearing: **dongliliu0@gmail.com**.
 
 ---
 
