@@ -625,3 +625,231 @@ func TestCaptureConsumptionConceptLessKeysOnItemID(t *testing.T) {
 		t.Fatalf("concept-less capture: events=%v, want [%v] under item-id spine", events, pa)
 	}
 }
+
+// The reconnect hole this pair of columns closes: a birth `add` op already carries
+// quietUntilFirstPurchase today, and before these columns existed the relay dropped it on persist —
+// so it reached a live-connected peer but was absent from the state snapshot a reconnecting peer
+// reads. A pre-columns items table gains both columns on InitDB, and an add carrying the quiet flag
+// then survives the state door. This test fails against the pre-change schema (no column to persist
+// into, so GetItems returns the zero value).
+func TestWantedAndQuietColumnMigrationAndBirthOp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prewanted.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	if _, err := legacy.Exec(`
+		CREATE TABLE rooms (
+		    cart_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, secret TEXT NOT NULL,
+		    created_at REAL NOT NULL, cart_name TEXT NOT NULL DEFAULT '', hex_color TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE items (
+		    id TEXT NOT NULL, cart_id TEXT NOT NULL, title TEXT, quantity INTEGER DEFAULT 1,
+		    checked INTEGER DEFAULT 0, notes TEXT, specification TEXT, urgency_level INTEGER DEFAULT 1,
+		    global_id TEXT, frequency_days INTEGER, is_active INTEGER DEFAULT 1, paused_at REAL,
+		    pause_reason TEXT, deferred_guess_date REAL, deferred_guess_authored_at REAL,
+		    purchased_at REAL, category_hint_name TEXT, category_hint_icon TEXT,
+		    category_hint_color TEXT, store_hint_brand TEXT, attributed_to TEXT, ts REAL NOT NULL,
+		    device_id TEXT, deleted INTEGER DEFAULT 0, deleted_at REAL,
+		    PRIMARY KEY (cart_id, id), FOREIGN KEY (cart_id) REFERENCES rooms(cart_id) ON DELETE CASCADE
+		);
+		INSERT INTO rooms VALUES ('cart-a','user-a','s',1,'A','');
+	`); err != nil {
+		t.Fatalf("seed pre-wanted schema: %v", err)
+	}
+	legacy.Close()
+
+	db, err := InitDB(path)
+	if err != nil {
+		t.Fatalf("InitDB on pre-wanted db: %v", err)
+	}
+	defer db.Close()
+
+	cols, err := existingColumns(db, "items")
+	if err != nil {
+		t.Fatalf("existingColumns: %v", err)
+	}
+	for _, c := range []string{"last_wanted_at", "quiet_until_first_purchase"} {
+		if !cols[c] {
+			t.Fatalf("migration did not add the %s column", c)
+		}
+	}
+
+	// The live bug: a quiet item is BORN quiet, on the add op. A peer that was offline at that moment
+	// learns it only from the state snapshot.
+	wanted := 1_700_000_000.0
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+		map[string]any{"title": "Sunscreen", "quietUntilFirstPurchase": true, "lastWantedAt": wanted},
+		1000, "dev-1", "user-a"); err != nil || !ok {
+		t.Fatalf("quiet add: ok=%v err=%v", ok, err)
+	}
+
+	items, err := GetItems(db, "cart-a")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("GetItems: err=%v n=%d", err, len(items))
+	}
+	if !items[0].QuietUntilFirstPurchase {
+		t.Error("state row quietUntilFirstPurchase = false, want true (a quiet birth must survive the state door)")
+	}
+	if items[0].LastWantedAt == nil || *items[0].LastWantedAt != wanted {
+		t.Errorf("state row lastWantedAt = %v, want %v", items[0].LastWantedAt, wanted)
+	}
+}
+
+// Both facts round-trip on a field-targeted `update` op at NON-DEFAULT values, through persistence and
+// back out of the state door — and the quiet flag clears when the client sends false (which is what a
+// purchase does). Asserting a non-default value is the point: `false` / nil would pass on a column that
+// was never written, and reading the row directly separates "persisted" from "returned by GetItems", so
+// dropping the column from either the insert/update list or the select list reddens a distinct line.
+func TestWantedAndQuietFieldUpdateRoundTrip(t *testing.T) {
+	db := testDB(t)
+
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+		map[string]any{"title": "Shampoo"}, 1000, "dev-1", "user-a"); err != nil || !ok {
+		t.Fatalf("add: ok=%v err=%v", ok, err)
+	}
+	// A plain add sets neither fact.
+	if items, err := GetItems(db, "cart-a"); err != nil || len(items) != 1 {
+		t.Fatalf("GetItems: err=%v n=%d", err, len(items))
+	} else if items[0].LastWantedAt != nil || items[0].QuietUntilFirstPurchase {
+		t.Errorf("plain add left lastWantedAt=%v quiet=%v, want nil/false",
+			items[0].LastWantedAt, items[0].QuietUntilFirstPurchase)
+	}
+
+	// A member resumes the item and asks for silence until its next purchase.
+	wanted := 1_700_123_456.0
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"lastWantedAt": wanted, "quietUntilFirstPurchase": true},
+		2000, "dev-1", "user-a"); err != nil || !ok {
+		t.Fatalf("wanted/quiet update: ok=%v err=%v", ok, err)
+	}
+
+	// Persisted in the row itself…
+	var rowWanted sql.NullFloat64
+	var rowQuiet int
+	if err := db.QueryRow(
+		`SELECT last_wanted_at, quiet_until_first_purchase FROM items WHERE cart_id=? AND id=?`,
+		"cart-a", "item-1",
+	).Scan(&rowWanted, &rowQuiet); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if !rowWanted.Valid || rowWanted.Float64 != wanted {
+		t.Errorf("row last_wanted_at = %v, want %v", rowWanted, wanted)
+	}
+	if rowQuiet != 1 {
+		t.Errorf("row quiet_until_first_purchase = %d, want 1", rowQuiet)
+	}
+
+	// …and returned through the state door.
+	items, err := GetItems(db, "cart-a")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("GetItems: err=%v n=%d", err, len(items))
+	}
+	if items[0].LastWantedAt == nil || *items[0].LastWantedAt != wanted {
+		t.Errorf("state row lastWantedAt = %v, want %v", items[0].LastWantedAt, wanted)
+	}
+	if !items[0].QuietUntilFirstPurchase {
+		t.Error("state row quietUntilFirstPurchase = false, want true")
+	}
+
+	// An unrelated op must not clear either fact — present-keys-only.
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"quantity": 3.0}, 3000, "dev-1", "user-a"); err != nil || !ok {
+		t.Fatalf("unrelated update: ok=%v err=%v", ok, err)
+	}
+	items, err = GetItems(db, "cart-a")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("GetItems after unrelated update: err=%v n=%d", err, len(items))
+	}
+	if items[0].LastWantedAt == nil || *items[0].LastWantedAt != wanted || !items[0].QuietUntilFirstPurchase {
+		t.Errorf("unrelated op disturbed the facts: lastWantedAt=%v quiet=%v",
+			items[0].LastWantedAt, items[0].QuietUntilFirstPurchase)
+	}
+
+	// The purchase arrives: the client sends the flag false and the silence ends.
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"checked": true, "quietUntilFirstPurchase": false},
+		4000, "dev-1", "user-a"); err != nil || !ok {
+		t.Fatalf("purchase update: ok=%v err=%v", ok, err)
+	}
+	items, err = GetItems(db, "cart-a")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("GetItems after purchase: err=%v n=%d", err, len(items))
+	}
+	if items[0].QuietUntilFirstPurchase {
+		t.Error("quiet flag still set after the purchase cleared it")
+	}
+	if items[0].LastWantedAt == nil || *items[0].LastWantedAt != wanted {
+		t.Errorf("purchase disturbed lastWantedAt = %v, want %v", items[0].LastWantedAt, wanted)
+	}
+}
+
+// The composite-key rebuild path (legacy global-`id` PRIMARY KEY) copies rows by explicit column
+// list. Both new columns must be in that list, or a rebuild silently drops facts that were already
+// persisted. This is the rebuild-path counterpart to the migration test above.
+func TestCompositeKeyRebuildCarriesWantedAndQuiet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacypk.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	if _, err := legacy.Exec(`
+		CREATE TABLE rooms (
+		    cart_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, secret TEXT NOT NULL,
+		    created_at REAL NOT NULL, cart_name TEXT NOT NULL DEFAULT '', hex_color TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE items (
+		    id TEXT PRIMARY KEY, cart_id TEXT NOT NULL, title TEXT, quantity INTEGER DEFAULT 1,
+		    checked INTEGER DEFAULT 0, notes TEXT, specification TEXT, urgency_level INTEGER DEFAULT 1,
+		    global_id TEXT, frequency_days INTEGER, is_active INTEGER DEFAULT 1, paused_at REAL,
+		    pause_reason TEXT, deferred_guess_date REAL, deferred_guess_authored_at REAL,
+		    purchased_at REAL, category_hint_name TEXT, category_hint_icon TEXT,
+		    category_hint_color TEXT, store_hint_brand TEXT,
+		    last_wanted_at REAL, quiet_until_first_purchase INTEGER DEFAULT 0,
+		    attributed_to TEXT, ts REAL NOT NULL, device_id TEXT,
+		    deleted INTEGER DEFAULT 0, deleted_at REAL
+		);
+		INSERT INTO rooms VALUES ('cart-a','user-a','s',1,'A','');
+		INSERT INTO items (id, cart_id, title, ts, last_wanted_at, quiet_until_first_purchase)
+		VALUES ('item-1','cart-a','Shampoo',1000,1700999000,1);
+	`); err != nil {
+		t.Fatalf("seed legacy-pk schema: %v", err)
+	}
+	legacy.Close()
+
+	// The row carries both facts BEFORE the rebuild. InitDB rebuilds the table onto the composite key
+	// by copying rows through an explicit column list — if either new column is missing from that list,
+	// the copy silently drops the fact and the assertions below redden.
+	db, err := InitDB(path)
+	if err != nil {
+		t.Fatalf("InitDB on legacy-pk db: %v", err)
+	}
+	defer db.Close()
+
+	pk, err := primaryKeyColumns(db, "items")
+	if err != nil {
+		t.Fatalf("primaryKeyColumns: %v", err)
+	}
+	if !pk["cart_id"] {
+		t.Fatal("composite-key rebuild did not run")
+	}
+	cols, err := existingColumns(db, "items")
+	if err != nil {
+		t.Fatalf("existingColumns: %v", err)
+	}
+	for _, c := range []string{"last_wanted_at", "quiet_until_first_purchase"} {
+		if !cols[c] {
+			t.Fatalf("rebuilt table is missing the %s column", c)
+		}
+	}
+
+	wanted := 1_700_999_000.0
+	items, err := GetItems(db, "cart-a")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("GetItems: err=%v n=%d", err, len(items))
+	}
+	if items[0].LastWantedAt == nil || *items[0].LastWantedAt != wanted || !items[0].QuietUntilFirstPurchase {
+		t.Errorf("rebuilt table lost the facts: lastWantedAt=%v quiet=%v",
+			items[0].LastWantedAt, items[0].QuietUntilFirstPurchase)
+	}
+}

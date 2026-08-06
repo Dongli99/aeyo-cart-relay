@@ -130,6 +130,22 @@ type ItemRow struct {
 	CategoryHintIcon  *string `json:"categoryHintIcon,omitempty"`
 	CategoryHintColor *string `json:"categoryHintColor,omitempty"`
 	StoreHintBrand    *string `json:"storeHintBrand,omitempty"`
+	// LastWantedAt is the instant a member last said they still want this item — resuming a paused
+	// item, or marking it needed now. It is a separate fact from Ts (which is only the ordering
+	// stamp for conflicting writes), and the app's staleness clock reads it: an item nobody has
+	// wanted for a long time is eventually paused. Carried on state rows, not only live messages, so
+	// a device that was offline when somebody re-confirmed the item does not pause it anyway.
+	// omitempty: an item nobody has re-confirmed omits the key, and the app falls back to Ts.
+	LastWantedAt *float64 `json:"lastWantedAt,omitempty"`
+	// QuietUntilFirstPurchase means "make no prediction about this item until it is next purchased" —
+	// a member's explicit request for silence, set when they dismiss a suggestion for an item they buy
+	// only occasionally. Stored so a member who was offline when it was set still learns the item is
+	// quiet; without it here, their device would keep predicting for an item the household muted.
+	//
+	// The name says "first" and the meaning is the NEXT purchase. That is deliberate: the key is the
+	// contract with apps already in the field, so the meaning widened and the key did not. Do not
+	// rename this column to match the meaning — it would silently stop matching the wire.
+	QuietUntilFirstPurchase bool `json:"quietUntilFirstPurchase"`
 }
 
 // MemberRemovedMsg is broadcast to all connected members when a member is revoked.

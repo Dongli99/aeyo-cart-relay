@@ -42,6 +42,8 @@ const itemsTableBody = `
     category_hint_icon  TEXT,
     category_hint_color TEXT,
     store_hint_brand    TEXT,
+    last_wanted_at REAL,
+    quiet_until_first_purchase INTEGER DEFAULT 0,
     attributed_to TEXT,
     ts            REAL NOT NULL,
     device_id     TEXT,
@@ -118,6 +120,17 @@ var itemFactColumns = []struct{ name, ddl string }{
 	{"category_hint_icon", "ALTER TABLE items ADD COLUMN category_hint_icon TEXT"},
 	{"category_hint_color", "ALTER TABLE items ADD COLUMN category_hint_color TEXT"},
 	{"store_hint_brand", "ALTER TABLE items ADD COLUMN store_hint_brand TEXT"},
+	// The instant a member last said they still want this item (resuming it, or marking it needed
+	// now). Stored so the fact survives a peer being offline: the app's staleness clock reads it, and
+	// without it here a reconnecting device would see only the older row timestamp and could pause an
+	// item somebody had just re-confirmed.
+	{"last_wanted_at", "ALTER TABLE items ADD COLUMN last_wanted_at REAL"},
+	// A flag meaning "make no prediction about this item until the NEXT purchase of it". The wire key
+	// says "first" for compatibility with clients already sending it; the meaning is the next
+	// purchase, not only the first one ever. Do not re-key it to match the meaning — the name is the
+	// contract with deployed apps. Stored so a member who was offline when the flag was set still
+	// learns the item is quiet instead of predicting for it.
+	{"quiet_until_first_purchase", "ALTER TABLE items ADD COLUMN quiet_until_first_purchase INTEGER DEFAULT 0"},
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +201,7 @@ func migrateItemsCompositeKey(db *sql.DB) error {
 		urgency_level, global_id, frequency_days, is_active, paused_at,
 		pause_reason, deferred_guess_date, deferred_guess_authored_at, purchased_at,
 		category_hint_name, category_hint_icon, category_hint_color, store_hint_brand,
+		last_wanted_at, quiet_until_first_purchase,
 		attributed_to, ts, device_id, deleted, deleted_at`
 
 	tx, err := db.Begin()
@@ -428,7 +442,8 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 		       notes, specification, COALESCE(urgency_level,1),
 		       global_id, frequency_days, COALESCE(is_active,1),
 		       paused_at, pause_reason, deferred_guess_date, deferred_guess_authored_at, purchased_at,
-		       category_hint_name, category_hint_icon, category_hint_color, store_hint_brand
+		       category_hint_name, category_hint_icon, category_hint_color, store_hint_brand,
+		       last_wanted_at, COALESCE(quiet_until_first_purchase,0)
 		FROM items
 		WHERE cart_id = ? AND deleted = 0
 		ORDER BY ts ASC
@@ -455,6 +470,7 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 		var categoryHintIcon sql.NullString
 		var categoryHintColor sql.NullString
 		var storeHintBrand sql.NullString
+		var lastWantedAt sql.NullFloat64
 		if err := rows.Scan(
 			&item.ID, &item.Title, &item.Quantity, &item.Checked,
 			&attributedTo, &item.Ts,
@@ -462,6 +478,7 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 			&globalID, &frequencyDays, &item.IsActive,
 			&pausedAt, &pauseReason, &deferredGuessDate, &deferredGuessAuthoredAt, &purchasedAt,
 			&categoryHintName, &categoryHintIcon, &categoryHintColor, &storeHintBrand,
+			&lastWantedAt, &item.QuietUntilFirstPurchase,
 		); err != nil {
 			return nil, err
 		}
@@ -507,6 +524,9 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 		}
 		if storeHintBrand.Valid {
 			item.StoreHintBrand = &storeHintBrand.String
+		}
+		if lastWantedAt.Valid {
+			item.LastWantedAt = &lastWantedAt.Float64
 		}
 		items = append(items, item)
 	}
@@ -845,6 +865,18 @@ func insertItem(
 	if v, ok := fields["storeHintBrand"]; ok {
 		storeHintBrand = v
 	}
+	// The instant a member last re-confirmed wanting this item. Persisted so it rides the reconnect
+	// snapshot, not only a live message — a device that was offline still learns the item was wanted.
+	var lastWantedAt any
+	if v, ok := fields["lastWantedAt"]; ok {
+		lastWantedAt = v
+	}
+	// "Predict nothing about this item until its next purchase." Present-keys-only like the rest; an
+	// absent key leaves the flag off. (The wire key says "first"; the meaning is the next purchase.)
+	quietUntilFirstPurchase := false
+	if v, ok := fields["quietUntilFirstPurchase"].(bool); ok {
+		quietUntilFirstPurchase = v
+	}
 
 	attributedTo := userID
 	// Uncheck clears attribution (§3.3 attribution rule).
@@ -866,14 +898,14 @@ func insertItem(
 		    (id, cart_id, title, quantity, checked, notes, specification, urgency_level,
 		     global_id, frequency_days, is_active, paused_at, pause_reason, deferred_guess_date,
 		     deferred_guess_authored_at, purchased_at, category_hint_name, category_hint_icon,
-		     category_hint_color, store_hint_brand,
+		     category_hint_color, store_hint_brand, last_wanted_at, quiet_until_first_purchase,
 		     attributed_to, ts, device_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, itemID, cartID, title, quantity, boolToInt(checked),
 		notes, specification, urgencyLevel,
 		globalID, frequencyDays, boolToInt(isActive), pausedAt, pauseReason, deferredGuessDate,
 		deferredGuessAuthoredAt, purchasedAt, categoryHintName, categoryHintIcon,
-		categoryHintColor, storeHintBrand,
+		categoryHintColor, storeHintBrand, lastWantedAt, boolToInt(quietUntilFirstPurchase),
 		attrParam, ts, deviceID)
 	return err == nil, err
 }
@@ -1039,6 +1071,20 @@ func updateItem(
 	if v, ok := fields["storeHintBrand"]; ok {
 		setClauses += ", store_hint_brand=?"
 		args = append(args, v)
+	}
+	// A member re-confirming they still want the item stamps this. Present-keys-only — an unrelated op
+	// never clears it, so the last re-confirmation stands until a newer one replaces it.
+	if v, ok := fields["lastWantedAt"]; ok {
+		setClauses += ", last_wanted_at=?"
+		args = append(args, v)
+	}
+	// Set when a member asks for no predictions until the next purchase; cleared by the client sending
+	// false once that purchase happens. (The wire key says "first"; the meaning is the next purchase.)
+	if v, ok := fields["quietUntilFirstPurchase"]; ok {
+		if b, ok := coerceBool("quietUntilFirstPurchase", v); ok {
+			setClauses += ", quiet_until_first_purchase=?"
+			args = append(args, boolToInt(b))
+		}
 	}
 
 	args = append(args, itemID, cartID)
