@@ -135,7 +135,10 @@ type ItemRow struct {
 	// stamp for conflicting writes), and the app's staleness clock reads it: an item nobody has
 	// wanted for a long time is eventually paused. Carried on state rows, not only live messages, so
 	// a device that was offline when somebody re-confirmed the item does not pause it anyway.
-	// omitempty: an item nobody has re-confirmed omits the key, and the app falls back to Ts.
+	// omitempty: an item nobody has re-confirmed omits the key. An absent key means "unchanged" and
+	// nothing else — a client must not fall back to Ts. Ts moves on any write, so reading a want from
+	// it would invent one out of an unrelated edit, which is the whole failure this field exists to
+	// avoid: an item somebody merely renamed would look like an item somebody asked for.
 	LastWantedAt *float64 `json:"lastWantedAt,omitempty"`
 	// QuietUntilFirstPurchase means "make no prediction about this item until it is next purchased" —
 	// a member's explicit request for silence, set when they dismiss a suggestion for an item they buy
