@@ -51,26 +51,63 @@ the code does not support — that is worth hearing: **dongliliu0@gmail.com**.
 
 ## The authentication model, stated plainly
 
-**Any member of a shared cart can connect to the WebSocket as any other member of that same
-cart.**
+**A WebSocket connection belongs to one person and carries every cart they are in. It proves
+each of those carts separately, with a secret only that member holds.**
 
-The WebSocket handler takes the user's identity from a self-asserted `X-User-ID` header and
-checks only that this ID belongs to the cart being joined
-([`handlers.go`](handlers.go), `wsHandler`). There is no per-session token and no proof of
-identity. Cart members already see each other's user IDs in check-off attribution, so
-impersonating a co-member is straightforward.
+One connection per device, not per cart. The client opens `/ws` and its first message names
+the carts it wants, each with a `subKey` — a 128-bit secret minted for that member of that
+cart at create or join time, returned to that member alone and never broadcast, never in a
+state message, never in another member's response. The server resolves each key back to the
+`(cart, member)` pair it was minted for
+([`handlers.go`](handlers.go), `verifySubscription`). The connection's identity comes from
+those keys; nothing about who you are is taken on your word.
 
-This is known and accepted, not overlooked. A shared cart is a household: the people in it
-already trust each other with the groceries, and the failure mode is a roommate marking milk
-as bought under your name. It is disclosed here because a reader would otherwise find it
-themselves and reasonably wonder what else went unmentioned.
+The same key authenticates **every cart-scoped request**, not only the socket
+([`handlers.go`](handlers.go), `authorizeCartActor`): leaving a cart, revoking a member,
+transferring ownership, reading or rotating the invite secret, and the two consumption-reservoir
+endpoints behind cadence learning. One credential per membership, not one per surface — and the
+cart a request acts on is taken from the key rather than from the URL or the body, so a valid key
+cannot reach a cart it was not minted for.
 
-It is **not** the case that a non-member can read your cart — membership is checked, and the
-cart ID plus an invite secret are required to become a member. The weakness is strictly
-*within* a cart, not across carts.
+**Naming who you are acting *on* is fine; naming who you *are* is not.** Requests still carry
+their target in the body — the member being revoked, the incoming owner — because a target is
+checkable against the room. The actor is not: a self-asserted actor is a claim, and comparing a
+claim against a fact only resembles authorization.
 
-If the stakes ever change — carts between strangers, anything of value in a cart — the fix
-is a per-member session token minted at join. That is on file and not yet needed.
+Two endpoints are exempt, by construction rather than oversight: **create** and **join** are where
+keys come from, so no key can exist yet. Create makes a new room owned by the caller, so an
+unproved identity there grants nothing; join is gated by the invite secret, a credential the
+caller must have been given.
+
+A pair that does not verify costs that one cart and nothing else — a member removed from one
+cart keeps syncing every other cart they are in. A key belonging to a different person is
+refused outright, so a connection cannot widen into somebody else's carts.
+
+Keys are per membership, so revocation is local: removing a member deletes their row and
+their key stops resolving in the same statement, while every other member's key keeps
+working. The server also ends that member's subscription on any connection they still hold —
+the socket now outlives the membership, so ending it is the server's job rather than the
+client's good behaviour.
+
+**Until 2026-08 this was much weaker, and the previous version of this file said so —
+though it did not say all of it.** The socket was per cart, identity was a self-asserted
+`X-User-ID` header, and any member of a cart could connect as any other member of that same
+cart. That was survivable while the cart ID was half of the address; it stopped being survivable
+the moment one connection could carry everything a person is in, which is why the credential
+above landed as part of the same change rather than after it.
+
+What the old disclosure **understated** is worth stating plainly, since the point of publishing
+this is that a reader can check it. The same self-asserted-identity shape reached further than the
+socket: because every member learns the owner's user ID from every state message, any member of a
+cart could also **transfer that cart's ownership to themselves**, **revoke any other member**,
+**force another member out**, and **read or rotate the invite secret** — each by writing the
+owner's ID into their own request. Those handlers compared a claim against a fact, which looks
+like an authorization check and is not one. All four were moved to the key in the same 2026-08
+work, and the tests that pin them assert the *refusal* — a non-owner member's key rejected where
+a claimed owner ID previously succeeded.
+
+It is **not** the case that a non-member can read your cart — the cart ID plus an invite
+secret are required to become a member, and membership is what mints a key.
 
 ---
 
@@ -109,8 +146,9 @@ The parts that matter for privacy, with somewhere to check each:
 
 ```
 main.go        routes, startup, the hourly tombstone prune
-handlers.go    HTTP endpoints — cart create/join/leave/revoke/transfer, invite, history
-hub.go         WebSocket fan-out to the members of a cart
+handlers.go    HTTP endpoints — cart create/join/leave/revoke/transfer, invite, history;
+               the WebSocket handshake and its subscription check
+hub.go         WebSocket fan-out to the members of a cart, and the per-connection message budget
 db.go          schema, migrations, last-write-wins merge, the consumption reservoir
 types.go       the wire format — JSON field names as the client sends them
 ratelimit.go   per-IP token bucket on the unauthenticated entry points
@@ -136,7 +174,11 @@ go build -o aeyo-cart-relay .
 ```
 
 Listens on `:8080`. It is meant to sit behind a reverse proxy that terminates TLS and
-forwards `/api/*` and `/ws/*`.
+forwards `/api/*` and `/ws`.
+
+The `members` table gained a column in 2026-08 and there is no migration for it: the schema
+is created only on a fresh database, so an older `aeyo.db` makes startup fail rather than run
+half-configured. Point `AEYO_DB_PATH` at a new file, or delete the old one.
 
 ```bash
 go test ./...

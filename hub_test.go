@@ -3,18 +3,26 @@ package main
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 // newTestClient builds a Client usable by handleDelta without a real WebSocket:
-// handleDelta only touches cartID/userID/deviceID and the buffered send channel
-// (the conn is used solely by the read/write pumps).
-func newTestClient(cartID, userID, deviceID string) *Client {
+// handleDelta only touches userID/deviceID, the subscription set, and the
+// buffered send channel (the conn is used solely by the read/write pumps).
+func newTestClient(userID, deviceID string) *Client {
 	return &Client{
-		cartID:   cartID,
-		userID:   userID,
-		deviceID: deviceID,
-		send:     make(chan []byte, 16),
+		userID:     userID,
+		deviceID:   deviceID,
+		send:       make(chan []byte, 16),
+		subscribed: make(map[string]bool),
 	}
+}
+
+// joinHub registers a client and subscribes it to cartIDs, the way wsHandler does.
+func joinHub(h *Hub, c *Client, cartIDs ...string) *Client {
+	h.Register(c)
+	h.Subscribe(c, cartIDs)
+	return c
 }
 
 // drainAck reads one message from a client's send channel and, if it is an ack,
@@ -36,15 +44,13 @@ func drainAck(c *Client) (status string, ok bool) {
 // connection survives (handleDelta returns normally, sending only a reject ack).
 func TestHandleDeltaRejectsMultiOp(t *testing.T) {
 	db := testDB(t)
-	if err := AddMember(db, "cart-a", "user-a"); err != nil {
+	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
 		t.Fatalf("AddMember: %v", err)
 	}
 	hub := NewHub()
 
-	sender := newTestClient("cart-a", "user-a", "dev-1")
-	peer := newTestClient("cart-a", "user-a", "dev-2")
-	hub.Register(sender)
-	hub.Register(peer)
+	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-a", "dev-2"), "cart-a")
 
 	raw, _ := json.Marshal(DeltaMsg{
 		Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: 1000,
@@ -76,15 +82,13 @@ func TestHandleDeltaRejectsMultiOp(t *testing.T) {
 // acked "applied" to the sender.
 func TestHandleDeltaSingleOpAppliesAndRelays(t *testing.T) {
 	db := testDB(t)
-	if err := AddMember(db, "cart-a", "user-a"); err != nil {
+	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
 		t.Fatalf("AddMember: %v", err)
 	}
 	hub := NewHub()
 
-	sender := newTestClient("cart-a", "user-a", "dev-1")
-	peer := newTestClient("cart-a", "user-a", "dev-2")
-	hub.Register(sender)
-	hub.Register(peer)
+	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-a", "dev-2"), "cart-a")
 
 	raw, _ := json.Marshal(DeltaMsg{
 		Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: 1000,
@@ -110,5 +114,201 @@ func TestHandleDeltaSingleOpAppliesAndRelays(t *testing.T) {
 		}
 	default:
 		t.Errorf("peer must receive the relayed single-op delta")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Multiplexing: one connection, several carts
+// ---------------------------------------------------------------------------
+
+// The load-bearing property of a user-scoped socket: carts multiplexed over one
+// connection stay separate. A delta naming cart B is persisted to cart B, is
+// relayed only to clients subscribed to cart B, and leaves cart A untouched.
+func TestMultiplexedDeltaStaysInItsCart(t *testing.T) {
+	db := testDB(t)
+	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
+		t.Fatalf("AddMember a: %v", err)
+	}
+	if _, err := AddMember(db, "cart-b", "user-a"); err != nil {
+		t.Fatalf("AddMember b: %v", err)
+	}
+	hub := NewHub()
+
+	// One connection carrying both carts, one peer in each.
+	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a", "cart-b")
+	peerA := joinHub(hub, newTestClient("user-a", "dev-2"), "cart-a")
+	peerB := joinHub(hub, newTestClient("user-a", "dev-3"), "cart-b")
+
+	raw, _ := json.Marshal(DeltaMsg{
+		Type: "delta", CartID: "cart-b", DeviceID: "dev-1", Ts: 1000,
+		Ops: []Op{{Op: "add", ID: "item-1", Fields: map[string]any{"title": "Milk"}}},
+	})
+	handleDelta(sender, hub, db, raw)
+
+	if title, found := itemTitle(t, db, "cart-b", "item-1"); !found || title != "Milk" {
+		t.Errorf("cart-b must hold the item: found=%v title=%q", found, title)
+	}
+	if _, found := itemTitle(t, db, "cart-a", "item-1"); found {
+		t.Errorf("cart-a must not receive a write addressed to cart-b")
+	}
+	if status, ok := drainAck(sender); !ok || status != "applied" {
+		t.Errorf("sender ack: status=%q ok=%v, want \"applied\"", status, ok)
+	}
+	if len(peerA.send) != 0 {
+		t.Errorf("a cart-a subscriber must not be relayed a cart-b delta")
+	}
+	if len(peerB.send) != 1 {
+		t.Errorf("a cart-b subscriber must be relayed the delta (queued %d)", len(peerB.send))
+	}
+}
+
+// The generalised connection-scope guard (RULE[sharing.acked-outbox] sub-rule 2,
+// ADR-038 finding 3): a delta for a cart this connection never proved is
+// rejected, not applied. The client keeps the write and re-routes it — which is
+// exactly what makes widening the client's flush to a SET safe.
+func TestDeltaForUnsubscribedCartIsRejected(t *testing.T) {
+	db := testDB(t)
+	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+	hub := NewHub()
+
+	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
+
+	raw, _ := json.Marshal(DeltaMsg{
+		Type: "delta", CartID: "cart-b", DeviceID: "dev-1", Ts: 1000,
+		Ops: []Op{{Op: "add", ID: "item-1", Fields: map[string]any{"title": "Milk"}}},
+	})
+	handleDelta(sender, hub, db, raw)
+
+	if status, ok := drainAck(sender); !ok || status != "rejected" {
+		t.Errorf("sender ack: status=%q ok=%v, want \"rejected\"", status, ok)
+	}
+	if _, found := itemTitle(t, db, "cart-b", "item-1"); found {
+		t.Errorf("an unsubscribed cart must not be written")
+	}
+}
+
+// A revoke or a leave ends the subscription server-side. The connection stays
+// open for the person's other carts, so nothing else may end it: the socket
+// outlives the membership now, and a client that ignored member_removed would
+// otherwise keep reading and writing a cart it was thrown out of.
+func TestUnsubscribeUserFromCartCutsOneCartOnly(t *testing.T) {
+	db := testDB(t)
+	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
+		t.Fatalf("AddMember a: %v", err)
+	}
+	if _, err := AddMember(db, "cart-b", "user-a"); err != nil {
+		t.Fatalf("AddMember b: %v", err)
+	}
+	hub := NewHub()
+
+	c := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a", "cart-b")
+
+	if !hub.UnsubscribeUserFromCart("user-a", "cart-a") {
+		t.Fatalf("UnsubscribeUserFromCart reported no subscription to drop")
+	}
+	if hub.IsSubscribed(c, "cart-a") {
+		t.Errorf("cart-a subscription survived the revoke")
+	}
+	if !hub.IsSubscribed(c, "cart-b") {
+		t.Errorf("cart-b subscription must be untouched by a cart-a revoke")
+	}
+
+	// The broadcast index must agree with the subscription set.
+	hub.BroadcastToCart("cart-a", []byte(`{"type":"noop"}`), "")
+	if len(c.send) != 0 {
+		t.Errorf("a revoked cart still reaches the connection through the broadcast index")
+	}
+	hub.BroadcastToCart("cart-b", []byte(`{"type":"noop"}`), "")
+	if len(c.send) != 1 {
+		t.Errorf("cart-b broadcast did not reach the connection (queued %d)", len(c.send))
+	}
+}
+
+// A dropped connection ends presence in EVERY cart it was shopping — one
+// connection now carries several, and the member walks away from all of them at
+// once. Each session_end names its own cart.
+func TestUnregisterEndsSessionInEveryActiveCart(t *testing.T) {
+	hub := NewHub()
+
+	leaver := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a", "cart-b")
+	watcher := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a", "cart-b")
+
+	hub.SetActiveShopping("cart-a", "user-a", "store-1")
+	hub.SetActiveShopping("cart-b", "user-a", "store-2")
+
+	hub.Unregister(leaver)
+
+	ended := map[string]bool{}
+	for len(watcher.send) > 0 {
+		var msg MemberSessionMsg
+		if err := json.Unmarshal(<-watcher.send, &msg); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if msg.Type == "member_session_end" && msg.UserID == "user-a" {
+			ended[msg.CartID] = true
+		}
+	}
+	for _, cartID := range []string{"cart-a", "cart-b"} {
+		if !ended[cartID] {
+			t.Errorf("no member_session_end relayed for %s", cartID)
+		}
+		if len(hub.GetActiveShopping(cartID)) != 0 {
+			t.Errorf("%s still lists the disconnected member as active", cartID)
+		}
+	}
+}
+
+// A re-subscribe replaces the set and reports only what is NEW, so adding one
+// cart to an open connection does not re-deliver every other cart's state.
+func TestSubscribeReportsOnlyNewCarts(t *testing.T) {
+	hub := NewHub()
+	c := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
+
+	added := hub.Subscribe(c, []string{"cart-a", "cart-b"})
+	if len(added) != 1 || added[0] != "cart-b" {
+		t.Errorf("Subscribe added = %v, want [cart-b]", added)
+	}
+	if hub.Subscribe(c, []string{"cart-a", "cart-b"}) != nil {
+		t.Errorf("an unchanged re-subscribe must add nothing")
+	}
+
+	// Dropping a cart deindexes it as well as unsetting it.
+	hub.Subscribe(c, []string{"cart-b"})
+	if hub.IsSubscribed(c, "cart-a") {
+		t.Errorf("cart-a survived a replacing subscribe")
+	}
+	hub.BroadcastToCart("cart-a", []byte(`{"type":"noop"}`), "")
+	if len(c.send) != 0 {
+		t.Errorf("a dropped cart still reaches the connection through the broadcast index")
+	}
+}
+
+// The per-connection message budget absorbs an initial-share burst instead of
+// severing it. The old 30-per-60s ceiling disconnected any share of more than 30
+// items mid-flush; the bucket now holds a burst far above that, and a message
+// past it waits rather than costing the connection.
+func TestMessageBudgetAbsorbsInitialShareBurst(t *testing.T) {
+	c := newTestClient("user-a", "dev-1")
+	c.tokens = wsBurstMsgs
+	c.lastToken = time.Now()
+
+	start := time.Now()
+	for i := 0; i < wsBurstMsgs; i++ {
+		c.awaitBudget()
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Errorf("a burst within capacity waited %v — it must not be throttled", elapsed)
+	}
+	if wsBurstMsgs <= 30 {
+		t.Errorf("burst capacity %d is no better than the ceiling it replaced", wsBurstMsgs)
+	}
+
+	// Past the burst the connection is throttled, never dropped.
+	start = time.Now()
+	c.awaitBudget()
+	if elapsed := time.Since(start); elapsed < time.Duration(float64(time.Second)/wsRefillPerSec)/2 {
+		t.Errorf("a message past the burst waited %v — the budget is not being enforced", elapsed)
 	}
 }

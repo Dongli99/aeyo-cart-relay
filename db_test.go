@@ -853,3 +853,113 @@ func TestCompositeKeyRebuildCarriesWantedAndQuiet(t *testing.T) {
 			items[0].LastWantedAt, items[0].QuietUntilFirstPurchase)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Member subscription keys
+// ---------------------------------------------------------------------------
+
+// The lookup that authenticates a user-scoped socket. An unknown key must
+// resolve to nothing at all — not to a cartID a caller could then subscribe to,
+// and not to a userID a caller could then write under. A partial tuple here
+// would be an authentication bypass wearing the shape of a lookup miss.
+func TestResolveSubKeyUnknownKeyYieldsNothing(t *testing.T) {
+	db := testDB(t)
+	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+
+	// The third is well-formed and simply never minted — the shape a real key has,
+	// which is the case a length or charset check would wave through.
+	for _, key := range []string{"", "not-a-key", generateSubKey()} {
+		cartID, userID, ok, err := ResolveSubKey(db, key)
+		if err != nil {
+			t.Fatalf("ResolveSubKey(%q): %v", key, err)
+		}
+		if ok {
+			t.Errorf("ResolveSubKey(%q) reported ok for a key never minted", key)
+		}
+		if cartID != "" || userID != "" {
+			t.Errorf("ResolveSubKey(%q) leaked a partial tuple: cart=%q user=%q", key, cartID, userID)
+		}
+	}
+}
+
+// The key a member holds resolves to exactly the pair it was minted for.
+func TestResolveSubKeyRoundTrip(t *testing.T) {
+	db := testDB(t)
+	key, err := AddMember(db, "cart-a", "user-a")
+	if err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+	if len(key) != 32 {
+		t.Errorf("sub_key = %q, want 32 hex chars (128 bits)", key)
+	}
+
+	cartID, userID, ok, err := ResolveSubKey(db, key)
+	if err != nil || !ok {
+		t.Fatalf("ResolveSubKey: ok=%v err=%v", ok, err)
+	}
+	if cartID != "cart-a" || userID != "user-a" {
+		t.Errorf("ResolveSubKey = (%q, %q), want (cart-a, user-a)", cartID, userID)
+	}
+}
+
+// Two members of the same cart get different keys, and a member of two carts
+// gets a different key per cart. The key is per membership, so revoking one
+// membership can never invalidate another.
+func TestSubKeysAreUniquePerMembership(t *testing.T) {
+	db := testDB(t)
+	if err := UpsertUser(db, "user-b", "B", "#000"); err != nil {
+		t.Fatalf("UpsertUser: %v", err)
+	}
+
+	aInA, _ := AddMember(db, "cart-a", "user-a")
+	bInA, _ := AddMember(db, "cart-a", "user-b")
+	aInB, _ := AddMember(db, "cart-b", "user-a")
+
+	for _, pair := range [][2]string{{aInA, bInA}, {aInA, aInB}, {bInA, aInB}} {
+		if pair[0] == pair[1] {
+			t.Errorf("two memberships share the key %q", pair[0])
+		}
+	}
+}
+
+// A re-join keeps the member's existing key. The key is per (cart, member) and
+// travels to that member's other devices, which have no way to learn of a
+// re-mint — so re-minting on an idempotent re-join would lock them out.
+func TestAddMemberRejoinKeepsKey(t *testing.T) {
+	db := testDB(t)
+	first, err := AddMember(db, "cart-a", "user-a")
+	if err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+	second, err := AddMember(db, "cart-a", "user-a")
+	if err != nil {
+		t.Fatalf("AddMember re-join: %v", err)
+	}
+	if first != second {
+		t.Errorf("re-join re-minted the key: %q → %q", first, second)
+	}
+}
+
+// Removing a member retires their key in the same statement — there is no
+// separate revocation list that could be forgotten. This is the whole
+// revocation story for the socket credential.
+func TestRemoveMemberRetiresSubKey(t *testing.T) {
+	db := testDB(t)
+	key, err := AddMember(db, "cart-a", "user-a")
+	if err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+	if err := RemoveMember(db, "cart-a", "user-a"); err != nil {
+		t.Fatalf("RemoveMember: %v", err)
+	}
+
+	cartID, userID, ok, err := ResolveSubKey(db, key)
+	if err != nil {
+		t.Fatalf("ResolveSubKey: %v", err)
+	}
+	if ok || cartID != "" || userID != "" {
+		t.Errorf("a removed member's key still resolves: ok=%v cart=%q user=%q", ok, cartID, userID)
+	}
+}

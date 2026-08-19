@@ -59,7 +59,9 @@ func main() {
 	mux.HandleFunc("GET /api/cart/{cartID}/history", historyReadHandler(db))
 	mux.HandleFunc("POST /api/cart/{cartID}/history/backfill", historyBackfillHandler(db))
 	mux.HandleFunc("GET /health", healthHandler)
-	mux.HandleFunc("/ws/", wsHandler(db, hub))
+	// One socket per person, not per cart: the carts it carries are named in its
+	// first message, so there is nothing to put in the path.
+	mux.HandleFunc("GET /ws", wsHandler(db, hub))
 
 	log.Printf("aeyo-cart-relay listening on :8080 (db: %s)", dbPath)
 	if err := http.ListenAndServe(":8080", mux); err != nil {

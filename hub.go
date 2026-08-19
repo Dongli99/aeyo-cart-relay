@@ -12,36 +12,83 @@ import (
 )
 
 const (
-	pingInterval   = 30 * time.Second
-	pongDeadline   = 10 * time.Second
-	writeDeadline  = 10 * time.Second
-	rateWindowSize = 60 * time.Second
-	rateLimitMsgs  = 30
+	pingInterval  = 30 * time.Second
+	pongDeadline  = 10 * time.Second
+	writeDeadline = 10 * time.Second
+
+	// subscribeDeadline bounds how long an upgraded-but-unidentified connection
+	// may sit before it names itself. Identity now arrives in the first message
+	// rather than in the handshake, so the window between upgrade and proof is
+	// the one moment an unauthenticated peer holds a connection at all.
+	subscribeDeadline = 10 * time.Second
+
+	// maxSubscribeCarts bounds one subscription request. A person is in a
+	// household's worth of carts, not a directory's; the cap keeps a malformed or
+	// hostile request from turning into an unbounded burst of key lookups.
+	maxSubscribeCarts = 64
+
+	// The per-connection message budget: a token bucket of wsBurstMsgs refilling
+	// at wsRefillPerSec, applied by WAITING for a token rather than by
+	// disconnecting (readPump's awaitBudget).
+	//
+	// The old shape was 30 messages per 60s, terminal. Both halves were wrong for
+	// a multiplexed socket. The ceiling was below a legitimate burst — sharing a
+	// personal cart queues one add per existing item and flushes them back to back
+	// the moment the connection opens, so any cart over 30 items disconnected the
+	// sharer mid-flush and healed 30 items per reconnect. And a single budget
+	// across a connection that now carries every one of a person's carts would
+	// have divided that same ceiling by the number of carts, making the limit
+	// tighter exactly for the people using the feature most.
+	//
+	// Waiting rather than disconnecting is what lets the burst be generous without
+	// weakening the guard: the bucket bounds the sustained WRITE RATE, which is
+	// the resource actually being protected, while a burst that exceeds it is
+	// delayed instead of severed. Nothing is lost and nothing needs healing.
+	// 2/sec sustained is far above a person editing a list and far below a flood.
+	wsBurstMsgs    = 240
+	wsRefillPerSec = 2.0
 
 	// maxWSMessageBytes caps a single inbound WebSocket frame. The only
 	// legitimate client→server messages are a single-op delta (Task F6 rejects
-	// multi-op) and the tiny session start/end envelopes; even a delta carrying
-	// long free-text notes/specification is a few KB. 512 KB leaves ~64× headroom
-	// over any real message while bounding a hostile client — gorilla closes the
-	// connection with a 1009 and ReadMessage returns an error when it is exceeded.
+	// multi-op), a subscription request, and the tiny session start/end envelopes;
+	// even a delta carrying long free-text notes/specification is a few KB. 512 KB
+	// leaves ~64× headroom over any real message while bounding a hostile client —
+	// gorilla closes the connection with a 1009 and ReadMessage returns an error
+	// when it is exceeded.
 	maxWSMessageBytes = 512 * 1024
 )
 
-// Client represents a single active WebSocket connection.
+// Client represents a single active WebSocket connection. One connection serves
+// one PERSON — every cart they belong to is multiplexed over it — so the client
+// holds a subscription SET rather than a cart.
+//
+// `subscribed` is owned by the Hub and read only through it (Subscribe /
+// IsSubscribed / SubscribedCarts): a re-subscribe arrives on the read pump while
+// broadcasts run on HTTP handler goroutines, so the set is shared state and the
+// hub's mutex is the one thing guarding it.
 type Client struct {
-	cartID      string
-	userID      string
-	deviceID    string
-	conn        *websocket.Conn
-	send        chan []byte
-	msgCount    int
-	windowStart time.Time
+	userID     string
+	deviceID   string
+	conn       *websocket.Conn
+	send       chan []byte
+	subscribed map[string]bool
+
+	// Message budget, touched only by the read pump.
+	tokens    float64
+	lastToken time.Time
 }
 
-// Hub manages per-cart WebSocket connections and in-memory active-shopping state.
+// Hub manages WebSocket connections and in-memory active-shopping state.
+//
+// Two indexes, because the two questions are different: `clients` answers "which
+// connections belong to this person" (a person on two devices), and `cartIndex`
+// answers "who must hear about this cart" — the fan-out every broadcast needs.
+// The second is derived from the subscription sets and maintained wherever they
+// change, so a broadcast never walks every connection asking.
 type Hub struct {
 	mu             sync.RWMutex
-	clients        map[string]map[*Client]bool  // cartID → set of clients
+	clients        map[string]map[*Client]bool  // userID → set of clients
+	cartIndex      map[string]map[*Client]bool  // cartID → set of subscribed clients
 	activeShopping map[string]map[string]string // cartID → userID → storeID
 }
 
@@ -49,51 +96,149 @@ type Hub struct {
 func NewHub() *Hub {
 	return &Hub{
 		clients:        make(map[string]map[*Client]bool),
+		cartIndex:      make(map[string]map[*Client]bool),
 		activeShopping: make(map[string]map[string]string),
 	}
 }
 
-// Register adds a client to the hub.
+// Register adds a client to the hub. It subscribes to nothing until Subscribe.
 func (h *Hub) Register(c *Client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.clients[c.cartID] == nil {
-		h.clients[c.cartID] = make(map[*Client]bool)
+	if h.clients[c.userID] == nil {
+		h.clients[c.userID] = make(map[*Client]bool)
 	}
-	h.clients[c.cartID][c] = true
+	h.clients[c.userID][c] = true
+	if c.subscribed == nil {
+		c.subscribed = make(map[string]bool)
+	}
 }
 
-// Unregister removes a client. If the user was in active-shopping, it relays
-// member_session_end to remaining connected members automatically.
-func (h *Hub) Unregister(c *Client) {
+// Subscribe REPLACES a client's subscription set with cartIDs and reindexes it.
+// Returns the carts newly added by this call, so the caller can send a state
+// snapshot for those alone — a re-subscribe that only adds one cart must not
+// re-deliver every other cart's full state.
+func (h *Hub) Subscribe(c *Client, cartIDs []string) []string {
 	h.mu.Lock()
-	wasActive := false
-	if h.activeShopping[c.cartID] != nil {
-		if _, ok := h.activeShopping[c.cartID][c.userID]; ok {
-			delete(h.activeShopping[c.cartID], c.userID)
-			wasActive = true
+	defer h.mu.Unlock()
+
+	next := make(map[string]bool, len(cartIDs))
+	var added []string
+	for _, id := range cartIDs {
+		if next[id] {
+			continue
+		}
+		next[id] = true
+		if !c.subscribed[id] {
+			added = append(added, id)
 		}
 	}
-	if h.clients[c.cartID] != nil {
-		delete(h.clients[c.cartID], c)
-		if len(h.clients[c.cartID]) == 0 {
-			delete(h.clients, c.cartID)
+
+	for id := range c.subscribed {
+		if !next[id] {
+			h.removeFromCartIndexLocked(c, id)
+		}
+	}
+	for id := range next {
+		if h.cartIndex[id] == nil {
+			h.cartIndex[id] = make(map[*Client]bool)
+		}
+		h.cartIndex[id][c] = true
+	}
+	c.subscribed = next
+	return added
+}
+
+// IsSubscribed reports whether this connection may act on cartID. It is the
+// generalisation of the old "does this message's cartID match the connection's"
+// check — the guard that keeps a client's writes inside the carts it proved.
+func (h *Hub) IsSubscribed(c *Client, cartID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return c.subscribed[cartID]
+}
+
+// SubscribedCarts returns a snapshot of the carts this connection is subscribed to.
+func (h *Hub) SubscribedCarts(c *Client) []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]string, 0, len(c.subscribed))
+	for id := range c.subscribed {
+		out = append(out, id)
+	}
+	return out
+}
+
+// UnsubscribeUserFromCart drops cartID from every connection belonging to
+// userID, and returns whether any connection was actually subscribed.
+//
+// This is what makes a revoke or a leave take effect on a socket that stays open
+// for the person's OTHER carts. While a connection served one cart, losing
+// membership and losing the connection were the same event and the client could
+// be trusted to tear itself down; now the connection outlives the membership, so
+// the server has to end the subscription itself.
+func (h *Hub) UnsubscribeUserFromCart(userID, cartID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	dropped := false
+	for c := range h.clients[userID] {
+		if c.subscribed[cartID] {
+			delete(c.subscribed, cartID)
+			h.removeFromCartIndexLocked(c, cartID)
+			dropped = true
+		}
+	}
+	return dropped
+}
+
+// removeFromCartIndexLocked drops c from cartID's fan-out set. Caller holds h.mu.
+func (h *Hub) removeFromCartIndexLocked(c *Client, cartID string) {
+	if h.cartIndex[cartID] == nil {
+		return
+	}
+	delete(h.cartIndex[cartID], c)
+	if len(h.cartIndex[cartID]) == 0 {
+		delete(h.cartIndex, cartID)
+	}
+}
+
+// Unregister removes a client. It relays member_session_end for EVERY cart the
+// connection was active-shopping in — a connection now carries several, and a
+// drop ends presence in all of them at once.
+func (h *Hub) Unregister(c *Client) {
+	h.mu.Lock()
+	var endedCarts []string
+	for cartID := range c.subscribed {
+		if h.activeShopping[cartID] != nil {
+			if _, ok := h.activeShopping[cartID][c.userID]; ok {
+				delete(h.activeShopping[cartID], c.userID)
+				endedCarts = append(endedCarts, cartID)
+			}
+		}
+		h.removeFromCartIndexLocked(c, cartID)
+	}
+	c.subscribed = make(map[string]bool)
+	if h.clients[c.userID] != nil {
+		delete(h.clients[c.userID], c)
+		if len(h.clients[c.userID]) == 0 {
+			delete(h.clients, c.userID)
 		}
 	}
 	h.mu.Unlock()
 
-	if wasActive {
-		msg := MemberSessionMsg{Type: "member_session_end", UserID: c.userID}
+	for _, cartID := range endedCarts {
+		msg := MemberSessionMsg{Type: "member_session_end", CartID: cartID, UserID: c.userID}
 		b, _ := json.Marshal(msg)
-		h.BroadcastToCart(c.cartID, b, c.deviceID)
+		h.BroadcastToCart(cartID, b, c.deviceID)
 	}
 }
 
-// BroadcastToCart sends msg to all clients in cartID except the one with excludeDeviceID.
+// BroadcastToCart sends msg to all clients subscribed to cartID except the one
+// with excludeDeviceID.
 func (h *Hub) BroadcastToCart(cartID string, msg []byte, excludeDeviceID string) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for c := range h.clients[cartID] {
+	for c := range h.cartIndex[cartID] {
 		if c.deviceID == excludeDeviceID {
 			continue
 		}
@@ -106,11 +251,12 @@ func (h *Hub) BroadcastToCart(cartID string, msg []byte, excludeDeviceID string)
 	}
 }
 
-// BroadcastToCartExcludeUser sends msg to all clients except those belonging to excludeUserID.
+// BroadcastToCartExcludeUser sends msg to all clients subscribed to cartID except
+// those belonging to excludeUserID.
 func (h *Hub) BroadcastToCartExcludeUser(cartID string, msg []byte, excludeUserID string) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for c := range h.clients[cartID] {
+	for c := range h.cartIndex[cartID] {
 		if c.userID == excludeUserID {
 			continue
 		}
@@ -203,7 +349,8 @@ func readPump(c *Client, h *Hub, db *sql.DB) {
 	})
 	c.conn.SetReadDeadline(time.Now().Add(pingInterval + pongDeadline))
 
-	c.windowStart = time.Now()
+	c.lastToken = time.Now()
+	c.tokens = wsBurstMsgs
 
 	for {
 		_, rawMsg, err := c.conn.ReadMessage()
@@ -211,27 +358,35 @@ func readPump(c *Client, h *Hub, db *sql.DB) {
 			// A clean disconnect is silent; an oversized frame (SetReadLimit →
 			// 1009) or other protocol error is logged as the anomaly it is.
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("readPump: read error for %s/%s: %v", c.cartID, c.userID, err)
+				log.Printf("readPump: read error for %s: %v", c.userID, err)
 			}
 			return
 		}
 
-		// Rate limit: >30 messages in any 60-second window → disconnect.
-		now := time.Now()
-		if now.Sub(c.windowStart) > rateWindowSize {
-			c.msgCount = 0
-			c.windowStart = now
-		}
-		c.msgCount++
-		if c.msgCount > rateLimitMsgs {
-			log.Printf("readPump: rate limit exceeded for %s/%s — disconnecting", c.cartID, c.userID)
-			c.conn.WriteMessage(websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "rate limit exceeded"))
-			return
-		}
-
+		c.awaitBudget()
 		handleMessage(c, h, db, rawMsg)
 	}
+}
+
+// awaitBudget spends one message token, waiting for it to refill if the bucket
+// is empty. Called only from the read pump, so the bucket needs no lock.
+//
+// The wait is bounded by 1/wsRefillPerSec — a fraction of a second, well inside
+// the read deadline, which the next ReadMessage resets from buffered pongs.
+func (c *Client) awaitBudget() {
+	now := time.Now()
+	c.tokens += now.Sub(c.lastToken).Seconds() * wsRefillPerSec
+	if c.tokens > wsBurstMsgs {
+		c.tokens = wsBurstMsgs
+	}
+	c.lastToken = now
+
+	if c.tokens < 1 {
+		time.Sleep(time.Duration((1 - c.tokens) / wsRefillPerSec * float64(time.Second)))
+		c.tokens = 1
+		c.lastToken = time.Now()
+	}
+	c.tokens--
 }
 
 // handleMessage dispatches a raw WebSocket message to the appropriate handler.
@@ -244,12 +399,59 @@ func handleMessage(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 	}
 
 	switch envelope.Type {
+	case "subscribe":
+		handleSubscribe(c, h, db, rawMsg)
 	case "delta":
 		handleDelta(c, h, db, rawMsg)
 	case "member_session_start":
 		handleSessionStart(c, h, rawMsg)
 	case "member_session_end":
 		handleSessionEnd(c, h, rawMsg)
+	}
+}
+
+// handleSubscribe applies a mid-connection subscription change: the person
+// joined a cart, left one, or was revoked from one, and their client re-derived
+// its set. The new set REPLACES the old, and only newly-added carts get a state
+// snapshot.
+//
+// A re-subscribe is verified exactly like the opening one, against this
+// connection's established userID — a connection can never widen into another
+// person's carts by sending a second subscribe.
+func handleSubscribe(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
+	var msg SubscribeMsg
+	if err := json.Unmarshal(rawMsg, &msg); err != nil {
+		return
+	}
+
+	_, accepted, rejected := verifySubscription(db, msg.Carts, c.userID)
+	added := h.Subscribe(c, accepted)
+
+	sendJSON(c, SubscribeResultMsg{
+		Type:     "subscribe_result",
+		V:        protocolVersion,
+		MinV:     minClientVersion,
+		Accepted: accepted,
+		Rejected: rejected,
+	})
+	for _, cartID := range added {
+		sendJSON(c, buildStateMsg(db, h, cartID))
+	}
+}
+
+// sendJSON queues a message for one connection. Non-blocking, like every other
+// send on the hub: a client too slow to drain its buffer misses the message and
+// re-derives on its next reconnect rather than stalling the sender.
+func sendJSON(c *Client, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("hub: marshal for %s: %v", c.userID, err)
+		return
+	}
+	select {
+	case c.send <- b:
+	default:
+		log.Printf("hub: dropping message for slow client %s", c.userID)
 	}
 }
 
@@ -284,15 +486,22 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 		if len(msg.Ops) > 0 {
 			itemID = msg.Ops[0].ID
 		}
-		log.Printf("handleDelta: rejecting %d-op delta (exactly 1 required) for %s/%s", len(msg.Ops), c.cartID, c.userID)
+		log.Printf("handleDelta: rejecting %d-op delta (exactly 1 required) for %s", len(msg.Ops), c.userID)
 		sendAck(c, msg.CartID, itemID, msg.Ts, "rejected")
 		return
 	}
 	op := msg.Ops[0]
 	itemID := op.ID
 
-	if msg.CartID != c.cartID {
-		log.Printf("handleDelta: cartID mismatch: msg=%s conn=%s", msg.CartID, c.cartID)
+	// The connection-scope guard, generalised: a delta may only touch a cart this
+	// connection PROVED, and the proof is per cart, never per connection. This was
+	// `msg.CartID != c.cartID` while a connection served one cart; widening the
+	// flush to a set without widening this check the same way is precisely the
+	// ADR-038 finding-3 shape — a socket carrying another cart's ops, discarded by
+	// the server, lost by the client.
+	cartID := strings.ToLower(msg.CartID)
+	if !h.IsSubscribed(c, cartID) {
+		log.Printf("handleDelta: cart %s not subscribed on this connection (%s)", cartID, c.userID)
 		sendAck(c, msg.CartID, itemID, msg.Ts, "rejected")
 		return
 	}
@@ -302,7 +511,7 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 		actor = systemActor
 	}
 
-	accepted, err := ApplyLWW(db, c.cartID, op.ID, op.Op, op.Fields, msg.Ts, msg.DeviceID, actor)
+	accepted, err := ApplyLWW(db, cartID, op.ID, op.Op, op.Fields, msg.Ts, msg.DeviceID, actor)
 	if err != nil {
 		log.Printf("handleDelta: ApplyLWW error: %v", err)
 		return
@@ -316,41 +525,67 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 	// consumption_events row, keyed by the reservoir spine COALESCE(global_id, id)
 	// (ADR-052 — concept-less items accrete under their cart-scoped item id).
 	if checkedVal, ok := op.Fields["checked"].(bool); ok {
-		captureConsumption(db, c.cartID, op.ID, checkedVal)
+		captureConsumption(db, cartID, op.ID, checkedVal)
 	}
 
 	// Inject the actor into the relayed message — the system sentinel for
 	// system-attributed writes, else the connection's authenticated userID.
 	msg.UserID = actor
+	msg.CartID = cartID
 	relayed, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
-	h.BroadcastToCart(c.cartID, relayed, c.deviceID)
+	h.BroadcastToCart(cartID, relayed, c.deviceID)
 
-	sendAck(c, msg.CartID, op.ID, msg.Ts, "applied")
+	sendAck(c, cartID, op.ID, msg.Ts, "applied")
 }
 
+// handleSessionStart / handleSessionEnd read the cart from the MESSAGE — the
+// connection no longer names one — and relay a re-marshalled envelope rather
+// than the raw frame, so the cartID peers receive is the normalised one this
+// connection was verified against.
 func handleSessionStart(c *Client, h *Hub, rawMsg []byte) {
-	var msg MemberSessionMsg
-	if err := json.Unmarshal(rawMsg, &msg); err != nil {
+	msg, cartID, ok := parseSessionMsg(c, h, rawMsg)
+	if !ok {
 		return
 	}
-	if msg.UserID != c.userID {
-		return // silently drop mismatched userID
-	}
-	h.SetActiveShopping(c.cartID, c.userID, msg.StoreID)
-	h.BroadcastToCart(c.cartID, rawMsg, c.deviceID)
+	h.SetActiveShopping(cartID, c.userID, msg.StoreID)
+	relaySessionMsg(c, h, msg, cartID)
 }
 
 func handleSessionEnd(c *Client, h *Hub, rawMsg []byte) {
-	var msg MemberSessionMsg
-	if err := json.Unmarshal(rawMsg, &msg); err != nil {
+	msg, cartID, ok := parseSessionMsg(c, h, rawMsg)
+	if !ok {
 		return
 	}
-	if msg.UserID != c.userID {
-		return // silently drop mismatched userID
+	h.ClearActiveShopping(cartID, c.userID)
+	relaySessionMsg(c, h, msg, cartID)
+}
+
+// parseSessionMsg decodes a presence envelope and applies both guards: the
+// sender may only speak for themselves, and only about a cart this connection
+// subscribed to.
+func parseSessionMsg(c *Client, h *Hub, rawMsg []byte) (MemberSessionMsg, string, bool) {
+	var msg MemberSessionMsg
+	if err := json.Unmarshal(rawMsg, &msg); err != nil {
+		return msg, "", false
 	}
-	h.ClearActiveShopping(c.cartID, c.userID)
-	h.BroadcastToCart(c.cartID, rawMsg, c.deviceID)
+	if msg.UserID != c.userID {
+		return msg, "", false // silently drop mismatched userID
+	}
+	cartID := strings.ToLower(msg.CartID)
+	if !h.IsSubscribed(c, cartID) {
+		return msg, "", false
+	}
+	return msg, cartID, true
+}
+
+func relaySessionMsg(c *Client, h *Hub, msg MemberSessionMsg, cartID string) {
+	msg.CartID = cartID
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	h.BroadcastToCart(cartID, b, c.deviceID)
 }

@@ -73,10 +73,20 @@ CREATE TABLE IF NOT EXISTS rooms (
     hex_color  TEXT NOT NULL DEFAULT ''
 );
 
+-- sub_key is the member's WebSocket subscription credential: a per-(cart, member)
+-- secret minted at create/join and handed to that member alone. The socket is
+-- user-scoped (one connection carries every cart a person belongs to), so the
+-- cart id is no longer half of the address and can no longer stand in for proof
+-- of membership — the key is what proves a connection may subscribe to a cart,
+-- and it also fixes the identity the connection writes under. It dies with the
+-- member row: a revoke or a leave removes the row, and the key stops resolving
+-- in the same statement. No cascade rotation — revoking one member leaves every
+-- other member's key working, which the shared invite secret cannot do.
 CREATE TABLE IF NOT EXISTS members (
     cart_id   TEXT NOT NULL,
     user_id   TEXT NOT NULL,
     joined_at REAL NOT NULL,
+    sub_key   TEXT NOT NULL,
     PRIMARY KEY (cart_id, user_id),
     FOREIGN KEY (cart_id) REFERENCES rooms(cart_id) ON DELETE CASCADE
 );
@@ -98,6 +108,10 @@ CREATE TABLE IF NOT EXISTS consumption_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_members_cart_id ON members(cart_id);
+-- UNIQUE, not merely an index: sub_key is looked up on its own to resolve a
+-- connection's (cart, user), so a collision would resolve one member's key to
+-- another member's row. The uniqueness is the lookup's correctness condition.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_members_sub_key ON members(sub_key);
 CREATE INDEX IF NOT EXISTS idx_items_cart_id   ON items(cart_id);
 CREATE INDEX IF NOT EXISTS idx_items_tombstone ON items(deleted, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_consumption_concept ON consumption_events(cart_id, global_id);
@@ -114,7 +128,7 @@ var itemFactColumns = []struct{ name, ddl string }{
 	{"pause_reason", "ALTER TABLE items ADD COLUMN pause_reason TEXT"},
 	{"deferred_guess_date", "ALTER TABLE items ADD COLUMN deferred_guess_date REAL"},
 	{"deferred_guess_authored_at", "ALTER TABLE items ADD COLUMN deferred_guess_authored_at REAL"}, // ADR-053 anchor authorship time
-	{"purchased_at", "ALTER TABLE items ADD COLUMN purchased_at REAL"}, // ADR-050 purchase fact time
+	{"purchased_at", "ALTER TABLE items ADD COLUMN purchased_at REAL"},                             // ADR-050 purchase fact time
 	// ADR-051 label hints — the sender's category/store labels, a receiver-side hydration backstop.
 	{"category_hint_name", "ALTER TABLE items ADD COLUMN category_hint_name TEXT"},
 	{"category_hint_icon", "ALTER TABLE items ADD COLUMN category_hint_icon TEXT"},
@@ -143,7 +157,11 @@ func InitDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("InitDB open: %w", err)
 	}
-	// SQLite performs best with a single writer connection.
+	// SQLite performs best with a single writer connection — and one caller depends on
+	// it for CORRECTNESS, not only for throughput: joinCartHandler's capacity check reads
+	// the member count and inserts in separate statements, and it is this serialisation,
+	// not its transaction, that stops two people joining a full cart at the same instant.
+	// ⚠️ Raising this re-opens that race; give that handler a real EXCLUSIVE lock first.
 	db.SetMaxOpenConns(1)
 
 	if _, err := db.Exec(schema); err != nil {
@@ -378,26 +396,59 @@ func GetMemberCount(db *sql.DB, cartID string) (int, error) {
 	return n, err
 }
 
-// HasPremiumOwner reports whether the cart's current owner has tier = 'premium'.
-func HasPremiumOwner(db *sql.DB, cartID string) (bool, error) {
-	var n int
-	err := db.QueryRow(`
-		SELECT EXISTS (
-		    SELECT 1 FROM rooms r
-		    JOIN users u ON r.owner_id = u.user_id
-		    WHERE r.cart_id = ? AND u.tier = 'premium'
-		)
-	`, cartID).Scan(&n)
-	return n > 0, err
+// AddMember upserts a member record and returns that member's subscription key
+// (idempotent — re-join is safe).
+//
+// A re-join KEEPS the existing key rather than minting a fresh one. The key is
+// per (cart, member), not per device, so re-minting would silently lock out the
+// member's other devices, which hold the old value and have no way to learn of
+// the change. Only a real membership change — a revoke or a leave, both of which
+// delete the row — retires a key.
+func AddMember(db *sql.DB, cartID, userID string) (string, error) {
+	if _, err := db.Exec(`
+		INSERT INTO members (cart_id, user_id, joined_at, sub_key)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(cart_id, user_id) DO UPDATE SET joined_at = excluded.joined_at
+	`, cartID, userID, float64(time.Now().Unix()), generateSubKey()); err != nil {
+		return "", err
+	}
+	return GetSubKey(db, cartID, userID)
 }
 
-// AddMember upserts a member record (idempotent — re-join is safe).
-func AddMember(db *sql.DB, cartID, userID string) error {
-	_, err := db.Exec(`
-		INSERT OR REPLACE INTO members (cart_id, user_id, joined_at)
-		VALUES (?, ?, ?)
-	`, cartID, userID, float64(time.Now().Unix()))
-	return err
+// GetSubKey returns the subscription key already minted for a member.
+func GetSubKey(db *sql.DB, cartID, userID string) (string, error) {
+	var subKey string
+	err := db.QueryRow(
+		`SELECT sub_key FROM members WHERE cart_id = ? AND user_id = ?`, cartID, userID,
+	).Scan(&subKey)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("not a member")
+	}
+	return subKey, err
+}
+
+// ResolveSubKey turns a subscription key into the (cart, member) pair it was
+// minted for. `ok` is false for an unknown key — including one that was valid
+// until its member row was deleted by a revoke or a leave.
+//
+// The identifiers are returned together or not at all: nothing that fails to
+// resolve may yield a cartID a caller could subscribe to, or a userID a caller
+// could write under. That is why this returns the pair rather than two lookups.
+func ResolveSubKey(db *sql.DB, subKey string) (cartID, userID string, ok bool, err error) {
+	if subKey == "" {
+		return "", "", false, nil
+	}
+	var c, u string
+	scanErr := db.QueryRow(
+		`SELECT cart_id, user_id FROM members WHERE sub_key = ?`, subKey,
+	).Scan(&c, &u)
+	if scanErr == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if scanErr != nil {
+		return "", "", false, scanErr
+	}
+	return c, u, true, nil
 }
 
 // RemoveMember deletes a member record.

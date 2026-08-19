@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 )
 
@@ -151,39 +152,110 @@ type ItemRow struct {
 	QuietUntilFirstPurchase bool `json:"quietUntilFirstPurchase"`
 }
 
+// The four messages below carried no cartID while a connection served exactly one
+// cart and the receiver could infer it. A connection now carries every cart its
+// member belongs to, so each states its own subject.
+
 // MemberRemovedMsg is broadcast to all connected members when a member is revoked.
 type MemberRemovedMsg struct {
 	Type   string `json:"type"`   // "member_removed"
+	CartID string `json:"cartID"` // the cart the member was removed from
 	UserID string `json:"userID"` // the removed member's userID
 }
 
 // SecretRotatedMsg is sent to remaining connected members after a revoke.
 type SecretRotatedMsg struct {
 	Type   string `json:"type"`   // "secret_rotated"
+	CartID string `json:"cartID"` // the cart whose invite secret changed
 	Secret string `json:"secret"` // new invite secret
 }
 
 // OwnerTransferredMsg is broadcast to all members when ownership changes.
 type OwnerTransferredMsg struct {
-	Type        string `json:"type"` // "owner_transferred"
+	Type        string `json:"type"`
+	CartID      string `json:"cartID"` // the cart whose owner changed
 	NewOwnerID  string `json:"newOwnerID"`
 	DisplayName string `json:"displayName"`
 }
 
 // MemberSessionMsg covers both member_session_start and member_session_end.
 // Differentiated by the "type" field. StoreID is omitted on session_end.
+// CartID travels in BOTH directions here: the client names the cart it is
+// shopping, and the relay names it again on the way out.
 type MemberSessionMsg struct {
 	Type    string `json:"type"` // "member_session_start" | "member_session_end"
+	CartID  string `json:"cartID"`
 	UserID  string `json:"userID"`
 	StoreID string `json:"storeID,omitempty"` // present on start, absent on end
 }
 
 // ---------------------------------------------------------------------------
+// Subscription — the client's opening move
+// ---------------------------------------------------------------------------
+
+// SubscribeMsg is the client→server subscription request. It is the first
+// message on a connection (nothing is registered before it arrives) and may be
+// sent again at any time to REPLACE the connection's subscription set, which is
+// how a cart the person just joined or left reaches an already-open socket
+// without a reconnect.
+type SubscribeMsg struct {
+	Type  string          `json:"type"`        // "subscribe"
+	V     int             `json:"v,omitempty"` // client protocol version; absent = 1
+	Carts []SubscribeCart `json:"carts"`
+}
+
+// SubscribeCart is one requested (cart, credential) pair. The key alone would be
+// enough to resolve the cart; the cartID is sent alongside so a client that has
+// mixed up its own storage is told so, instead of silently subscribing to a cart
+// it did not mean.
+type SubscribeCart struct {
+	CartID string `json:"cartID"`
+	SubKey string `json:"subKey"`
+}
+
+// SubscribeResultMsg answers a SubscribeMsg. A pair that fails to verify is
+// reported here and the rest of the subscription proceeds — one revoked cart
+// must not cost a person the sync of every other cart they are in.
+type SubscribeResultMsg struct {
+	Type     string            `json:"type"` // "subscribe_result"
+	V        int               `json:"v"`
+	MinV     int               `json:"minV"`
+	Accepted []string          `json:"accepted"`
+	Rejected []SubscribeReject `json:"rejected"`
+}
+
+// SubscribeReject explains one refused pair. The client treats a rejected cart
+// the way it treats member_removed: it is no longer in that cart.
+type SubscribeReject struct {
+	CartID string `json:"cartID"`
+	Reason string `json:"reason"`
+}
+
+// Rejection reasons. They distinguish "you are not in this cart any more" from
+// "this request is malformed", because the client acts on the first and only
+// logs the second.
+const (
+	rejectUnknownKey   = "unknown_key"   // no member row holds this key — never minted, or revoked/left since
+	rejectCartMismatch = "cart_mismatch" // the key is valid but was minted for a different cart
+	rejectMalformed    = "malformed"     // not a cart id shape, or an empty key
+	rejectUserMismatch = "user_mismatch" // the key belongs to a different person than this connection's other keys
+)
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// generateSecret returns a 128-bit random invite token in the form
-// "AEYO-XXXX-XXXX-XXXX-XXXX" where each X is an uppercase hex digit.
+// generateSecret returns a random invite token in the form
+// "AEYO-XXXX-XXXX-XXXX-XXXX" where each X is an uppercase hex digit — 8 bytes,
+// so 64 bits of entropy.
+//
+// 64 rather than 128 because this is a code a person reads aloud, types from a
+// message, or scans off a QR, and every extra group makes that worse. What makes
+// 64 enough is the rate limiter in front of it: /api/cart/join is capped per IP
+// at a burst of 15 refilling 1/sec, so an online guessing attack gets nowhere
+// near 2^64, and the secret is rotated on every revoke besides. A credential
+// that is never read by a human has no such tradeoff — see generateSubKey,
+// which takes the full 16 bytes.
 func generateSecret() string {
 	b := make([]byte, 8) // 8 bytes = 16 hex chars = 4 groups of 4
 	if _, err := rand.Read(b); err != nil {
@@ -196,6 +268,19 @@ func generateSecret() string {
 		uint16(b[4])<<8|uint16(b[5]),
 		uint16(b[6])<<8|uint16(b[7]),
 	)
+}
+
+// generateSubKey returns a 128-bit random member subscription key as 32
+// lowercase hex characters. Unlike the invite secret it is never read aloud,
+// typed, or put in a link, so it carries no grouping and no prefix — it is only
+// ever moved machine-to-machine.
+func generateSubKey() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failure is unrecoverable in a security context
+		panic(fmt.Sprintf("generateSubKey: crypto/rand failed: %v", err))
+	}
+	return hex.EncodeToString(b)
 }
 
 // newUUID returns a random UUID v4 string.
