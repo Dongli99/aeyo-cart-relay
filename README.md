@@ -79,6 +79,28 @@ keys come from, so no key can exist yet. Create makes a new room owned by the ca
 unproved identity there grants nothing; join is gated by the invite secret, a credential the
 caller must have been given.
 
+**Create lets the caller propose the room's id, and that is worth stating in full**, because it is
+the one place the exemption above was re-examined rather than inherited. A cart's id is immutable
+once shared — every pending write, invite link and member device keys off it — so a client whose
+room has been deleted can only recover the cart *under its own id*; minting a new one would strand
+everything that already refers to the old. Sending `cartID` is therefore allowed, and omitting it
+mints one as before.
+
+What create will not do with a proposed id is the substance of it. **An id whose room exists is
+refused** — never adopted, never re-owned, never re-secreted — and **an id with no room but with
+surviving rows is refused too**. The second refusal is unreachable in a healthy database, where
+deleting a room takes its members, items and events with it; it is there so that "create touches no
+existing data" is true on its own terms rather than on the strength of a cascade, and if it ever
+fires it is telling us the cascade stopped.
+
+The residual, stated plainly because the point of publishing this is that a reader can check it:
+**every member of a cart knows its id**, so once a room is deleted an ex-member can re-create it
+with themselves as owner. What they get is an empty room and a fresh secret. They get no items, no
+members, and no way to draw the real members in — those devices hold the old secret, and their join
+is refused against the new one. The cost is that the cart loses its identifier and its owner must
+re-share under a new one; the gain to the squatter is nothing. It is available only to someone who
+was already a member of that cart, and only after its room is gone.
+
 A pair that does not verify costs that one cart and nothing else — a member removed from one
 cart keeps syncing every other cart they are in. A key belonging to a different person is
 refused outright, so a connection cannot widen into somebody else's carts.

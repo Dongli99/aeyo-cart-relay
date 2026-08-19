@@ -1,7 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
+	"os"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -311,4 +319,166 @@ func TestMessageBudgetAbsorbsInitialShareBurst(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < time.Duration(float64(time.Second)/wsRefillPerSec)/2 {
 		t.Errorf("a message past the burst waited %v — the budget is not being enforced", elapsed)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// One writer per connection (R-400)
+// ---------------------------------------------------------------------------
+
+// socketWriteOwners is the allowlist: the functions permitted to write to a
+// WebSocket connection, each with the reason it is allowed.
+//
+//   - writePump — THE owner. Once it is running it is the only goroutine that may
+//     write, because gorilla/websocket permits exactly one concurrent writer and
+//     traps a second one by design.
+//   - closeUnsubscribed — runs BEFORE any pump exists (wsHandler refusing a
+//     handshake), so there is no second writer to race. This is the distinction
+//     that matters: the rule is not "only writePump touches the conn", it is
+//     "once writePump is started, nothing else writes".
+//
+// Adding a name here is the point of the mechanism, not a way around it: it makes
+// an author state which of those two cases their new write is.
+var socketWriteOwners = map[string]string{
+	"writePump":         "the owner — the one goroutine that writes a live connection",
+	"closeUnsubscribed": "pre-pump: refuses a handshake before writePump is started",
+}
+
+// socketWriteMethods are the gorilla/websocket calls that write to the wire or
+// arm a write. SetWriteDeadline is included deliberately — it mutates the write
+// half's state, so calling it from a second goroutine is the same defect with a
+// quieter symptom.
+var socketWriteMethods = map[string]bool{
+	"WriteMessage":         true,
+	"WriteJSON":            true,
+	"WriteControl":         true,
+	"WritePreparedMessage": true,
+	"NextWriter":           true,
+	"SetWriteDeadline":     true,
+}
+
+// findSocketWrites reports every socket write in src as "function:method", using
+// the enclosing top-level function's name. A receiver is treated as a connection
+// when its expression mentions `conn`, which is how both files name it.
+func findSocketWrites(t *testing.T, filename, src string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filename, src, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", filename, err)
+	}
+
+	var found []string
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || !socketWriteMethods[sel.Sel.Name] {
+				return true
+			}
+			var receiver bytes.Buffer
+			if err := printer.Fprint(&receiver, fset, sel.X); err != nil {
+				return true
+			}
+			if !strings.Contains(receiver.String(), "conn") {
+				return true
+			}
+			found = append(found, fn.Name.Name+":"+sel.Sel.Name)
+			return true
+		})
+	}
+	return found
+}
+
+// Exactly one goroutine writes a live connection, and nothing in the code says so
+// — which is how it broke. At 65c40d6 readPump's rate-limit branch wrote its own
+// close frame while writePump owned the connection: a real "concurrent write to
+// websocket connection" panic, recovered per-connection by net/http, so the
+// service stayed up and nobody read it for twelve days. It went away as a SIDE
+// EFFECT of 1ec1f66 deleting that whole branch (the budget now waits instead of
+// disconnecting) — the commit message never mentions it — so nothing prevents the
+// shape returning the next time somebody adds an early-return disconnect.
+//
+// The test is deliberately static rather than a -race case driving a disconnect.
+// The disconnect path this bug lived on no longer exists, so a -race test would
+// have to manufacture a second writer to have anything to detect — proving the
+// race detector works, not that the code is right — and a race detector reports
+// only interleavings it actually observes, so a green run would be silence
+// mistaken for proof. Reading the source answers the real question directly: is
+// there a socket write anywhere but its owner?
+func TestOnlyTheWritePumpWritesTheConnection(t *testing.T) {
+	for _, filename := range []string{"hub.go", "handlers.go"} {
+		src, err := os.ReadFile(filename)
+		if err != nil {
+			t.Fatalf("read %s: %v", filename, err)
+		}
+		writes := findSocketWrites(t, filename, string(src))
+		if len(writes) == 0 {
+			t.Errorf("%s: no socket writes found at all — the scan has lost its subject, "+
+				"which makes a pass here meaningless", filename)
+		}
+		for _, w := range writes {
+			fn := strings.SplitN(w, ":", 2)[0]
+			if _, allowed := socketWriteOwners[fn]; !allowed {
+				t.Errorf("%s: %s writes the connection, and only these may: %v. "+
+					"Two goroutines on one socket is a panic gorilla/websocket raises by design, "+
+					"and net/http recovers it per connection — so it will not crash, it will just "+
+					"be wrong quietly. Queue it on c.send instead.",
+					filename, w, keysOf(socketWriteOwners))
+			}
+		}
+	}
+}
+
+// The scan's own canary. A checker whose healthy output is silence owes a second
+// mechanism proving it can still see its subject: this feeds it the exact defect
+// from 65c40d6 and fails if the scan shrugs.
+func TestSocketWriteScanCatchesTheOriginalDefect(t *testing.T) {
+	const regressionSource = `package main
+
+func writePump(c *Client) {
+	c.conn.WriteMessage(1, nil)
+}
+
+func readPump(c *Client) {
+	for {
+		if c.tokens < 1 {
+			c.conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "rate limit exceeded"))
+			return
+		}
+	}
+}
+`
+	writes := findSocketWrites(t, "regression.go", regressionSource)
+
+	var offenders []string
+	for _, w := range writes {
+		if fn := strings.SplitN(w, ":", 2)[0]; socketWriteOwners[fn] == "" {
+			offenders = append(offenders, w)
+		}
+	}
+	if len(offenders) != 1 || offenders[0] != "readPump:WriteMessage" {
+		t.Errorf("the scan reported %v as offending; want exactly [readPump:WriteMessage] — "+
+			"it can no longer see the defect it exists to catch", offenders)
+	}
+	if len(writes) != 2 {
+		t.Errorf("the scan found %d writes in the fixture, want 2 — it must see the legal one too, "+
+			"or it is passing by blindness rather than by correctness", len(writes))
+	}
+}
+
+func keysOf(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

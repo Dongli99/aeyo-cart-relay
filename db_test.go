@@ -963,3 +963,64 @@ func TestRemoveMemberRetiresSubKey(t *testing.T) {
 		t.Errorf("a removed member's key still resolves: ok=%v cart=%q user=%q", ok, cartID, userID)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Cascade
+// ---------------------------------------------------------------------------
+
+// Deleting a room takes its members, items and consumption events with it.
+//
+// The schema has said so since the beginning and nothing ever checked it, which
+// was fine while the cascade was only housekeeping. It stopped being only that
+// when create began accepting a client-PROPOSED cart id: what makes "create
+// touches no existing data" true for a proposed id is that a dead room leaves
+// nothing behind to adopt. The guarantee runs through `PRAGMA foreign_keys=ON`,
+// a PER-CONNECTION setting that holds today only because InitDB pins the pool to
+// one connection — see the ⚠️ at SetMaxOpenConns. This test is what fails if that
+// changes, instead of the failure being a stranger reading somebody's cart.
+func TestDeleteRoomCascadesToEveryDependentTable(t *testing.T) {
+	db := testDB(t)
+
+	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+		map[string]any{"title": "Milk"}, 1000, "dev-1", "user-a"); err != nil || !ok {
+		t.Fatalf("add item: ok=%v err=%v", ok, err)
+	}
+	if err := BackfillConsumptionEvents(db, "cart-a", "item-1", []float64{1000}); err != nil {
+		t.Fatalf("BackfillConsumptionEvents: %v", err)
+	}
+	// A positive before the negative: the rows have to be there for their absence
+	// afterwards to mean anything.
+	if residue, err := CartIDResidue(db, "cart-a"); err != nil || !residue {
+		t.Fatalf("fixture: CartIDResidue = %v, %v; want rows present before the delete", residue, err)
+	}
+
+	if err := DeleteRoom(db, "cart-a"); err != nil {
+		t.Fatalf("DeleteRoom: %v", err)
+	}
+
+	for _, tc := range []struct{ table, query string }{
+		{"members", `SELECT COUNT(*) FROM members WHERE cart_id = 'cart-a'`},
+		{"items", `SELECT COUNT(*) FROM items WHERE cart_id = 'cart-a'`},
+		{"consumption_events", `SELECT COUNT(*) FROM consumption_events WHERE cart_id = 'cart-a'`},
+	} {
+		var n int
+		if err := db.QueryRow(tc.query).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", tc.table, err)
+		}
+		if n != 0 {
+			t.Errorf("%s: %d rows survived the room — the cascade is not firing", tc.table, n)
+		}
+	}
+	// The neighbouring room is untouched: a cascade that took everything would
+	// pass the assertions above for the wrong reason.
+	var others int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM rooms WHERE cart_id = 'cart-b'`).Scan(&others); err != nil {
+		t.Fatalf("count rooms: %v", err)
+	}
+	if others != 1 {
+		t.Errorf("cart-b rooms = %d, want 1", others)
+	}
+}

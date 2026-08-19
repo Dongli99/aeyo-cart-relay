@@ -304,6 +304,21 @@ func (h *Hub) GetActiveShopping(cartID string) []ActiveShoppingEntry {
 
 // writePump drains c.send and writes each message to the WebSocket.
 // It also sends periodic pings.
+//
+// ⚠️ **Once this is running it is the ONLY goroutine that may write this
+// connection.** gorilla/websocket permits exactly one concurrent writer and traps
+// a second by design; net/http then recovers the panic per connection, so the
+// service stays up, /health stays green, and the defect is invisible except in the
+// journal. That is not hypothetical here: readPump's rate-limit branch wrote its
+// own close frame until 1ec1f66, and it panicked in production for twelve days
+// before anybody read the log (R-400). The branch is gone because the budget now
+// WAITS instead of disconnecting — the fix was a side effect, not a decision,
+// which is why the rule is written down here and asserted by
+// TestOnlyTheWritePumpWritesTheConnection.
+//
+// A path that needs to say something to a client queues it on `c.send`. Writing
+// directly is correct only BEFORE this pump starts — `closeUnsubscribed` is that
+// case and the only one.
 func writePump(c *Client) {
 	ticker := time.NewTicker(pingInterval)
 	defer func() {

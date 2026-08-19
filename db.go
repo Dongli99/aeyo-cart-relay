@@ -157,11 +157,22 @@ func InitDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("InitDB open: %w", err)
 	}
-	// SQLite performs best with a single writer connection — and one caller depends on
-	// it for CORRECTNESS, not only for throughput: joinCartHandler's capacity check reads
-	// the member count and inserts in separate statements, and it is this serialisation,
-	// not its transaction, that stops two people joining a full cart at the same instant.
-	// ⚠️ Raising this re-opens that race; give that handler a real EXCLUSIVE lock first.
+	// SQLite performs best with a single writer connection — and TWO things depend on
+	// it for CORRECTNESS, not only for throughput. Both have to be discharged before it
+	// is raised, and the second is the easy one to miss because nothing here asks for it.
+	//
+	// 1. joinCartHandler's capacity check reads the member count and inserts in separate
+	//    statements, and it is this serialisation, not its transaction, that stops two
+	//    people joining a full cart at the same instant. Give that handler a real
+	//    EXCLUSIVE lock before raising this.
+	// 2. ⚠️ `PRAGMA foreign_keys=ON` is a PER-CONNECTION setting, applied once in the
+	//    schema below. With one connection for the process lifetime it holds for every
+	//    statement; with a pool, connections opened later run with foreign keys OFF and
+	//    every ON DELETE CASCADE in the schema silently stops firing. That is not
+	//    housekeeping: createCartHandler accepts a client-PROPOSED cart id and promises
+	//    it touches no existing data, which rests on a deleted room taking its members,
+	//    items and consumption events with it. Set the pragma on every new connection
+	//    (a connector hook, not a one-shot Exec) before raising this.
 	db.SetMaxOpenConns(1)
 
 	if _, err := db.Exec(schema); err != nil {
@@ -374,6 +385,36 @@ func RotateSecret(db *sql.DB, cartID string) (string, error) {
 func DeleteRoom(db *sql.DB, cartID string) error {
 	_, err := db.Exec(`DELETE FROM rooms WHERE cart_id = ?`, cartID)
 	return err
+}
+
+// RoomExists reports whether a room already occupies this cart id. Used by
+// create to refuse a client-proposed id rather than adopt or overwrite the room
+// already living at it.
+func RoomExists(db *sql.DB, cartID string) (bool, error) {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM rooms WHERE cart_id = ?`, cartID).Scan(&n)
+	return n > 0, err
+}
+
+// CartIDResidue reports whether any row keyed to cartID survives in the tables
+// that hang off rooms, with no room to own them.
+//
+// In a healthy database this is unreachable — every one of those tables declares
+// ON DELETE CASCADE and the pragma is on — which is exactly why create calls it.
+// A client may PROPOSE a cart id, and the promise attached to that (create
+// "touches no existing data") must be true on its own terms rather than on the
+// strength of a cascade nothing tests and one refactor could switch off. If this
+// ever returns true, the cascade is not doing what the schema says and the right
+// answer is to refuse rather than hand the caller somebody else's rows.
+func CartIDResidue(db *sql.DB, cartID string) (bool, error) {
+	var n int
+	err := db.QueryRow(`
+		SELECT
+		    (SELECT COUNT(*) FROM members            WHERE cart_id = ?) +
+		    (SELECT COUNT(*) FROM items              WHERE cart_id = ?) +
+		    (SELECT COUNT(*) FROM consumption_events WHERE cart_id = ?)
+	`, cartID, cartID, cartID).Scan(&n)
+	return n > 0, err
 }
 
 // ---------------------------------------------------------------------------

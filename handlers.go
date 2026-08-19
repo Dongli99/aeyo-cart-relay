@@ -69,6 +69,26 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) error {
 // It is safe unproved because it creates a NEW room owned by the caller: the
 // worst a forged userID achieves is minting a cart for somebody else's ID, which
 // grants the forger nothing and touches no existing data.
+//
+// ⚠️ The caller MAY PROPOSE the room's id (`cartID`), and that clause is the one
+// the proposal tests, so it is enforced here rather than assumed. A proposed id
+// is refused if a room already occupies it, and refused again if any row keyed to
+// it survives without a room (`CartIDResidue`). What create does with a proposed
+// id is therefore exactly what it does with a minted one: fill an id that holds
+// nothing. It never adopts, re-owns, or re-secrets an existing room.
+//
+// What the proposal buys an attacker, stated plainly because the README publishes
+// it: every member of a cart knows its id, so once a room is DELETED an ex-member
+// can re-create it with themselves as owner. They get an empty room and a fresh
+// secret — no items, no members, and no way to draw the real members in, since
+// those devices hold the old secret and their join is refused. The residual is a
+// squat that costs that one dead cart its identifier, available only to someone
+// who was already a member of it. Weigh any change here against that sentence.
+//
+// Why the proposal exists at all: a cart's uuid is immutable once shared
+// (RULE[sharing.cart-uuid-immutable]), so a client repairing a cart whose room is
+// gone must re-create it UNDER ITS OWN id — minting a new one would rewrite the
+// key every pending write, invite link, and member device already uses.
 func createCartHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -77,10 +97,48 @@ func createCartHandler(db *sql.DB) http.HandlerFunc {
 			Color       string `json:"color"`
 			CartName    string `json:"cartName"`
 			HexColor    string `json:"hexColor"`
+			// Optional. Absent (the 1.7.6 client and every ordinary first share) →
+			// minted below, exactly as before.
+			CartID string `json:"cartID"`
 		}
 		if err := decodeBody(w, r, &body); err != nil || body.UserID == "" {
 			writeError(w, http.StatusBadRequest, "invalid request body")
 			return
+		}
+
+		cartID := body.CartID
+		if cartID == "" {
+			cartID = newUUID()
+		} else {
+			if !isValidCartID(cartID) {
+				log.Printf("createCart: rejecting malformed proposed cartID from %s", clientIP(r))
+				writeError(w, http.StatusBadRequest, "invalid cartID")
+				return
+			}
+			exists, err := RoomExists(db, cartID)
+			if err != nil {
+				log.Printf("createCart: RoomExists: %v", err)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			if exists {
+				writeError(w, http.StatusConflict, "cart already exists")
+				return
+			}
+			residue, err := CartIDResidue(db, cartID)
+			if err != nil {
+				log.Printf("createCart: CartIDResidue: %v", err)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			if residue {
+				// Unreachable while the cascade works, so treat a firing as the alarm it
+				// is: refusing keeps the promise above true, and the log line is how we
+				// find out the cascade stopped.
+				log.Printf("createCart: REFUSING proposed cartID %s — rows survive with no room (cascade not firing?)", cartID)
+				writeError(w, http.StatusConflict, "cart already exists")
+				return
+			}
 		}
 
 		if err := UpsertUser(db, body.UserID, body.DisplayName, body.Color); err != nil {
@@ -89,7 +147,6 @@ func createCartHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		cartID := newUUID()
 		secret := generateSecret()
 
 		if err := CreateRoom(db, cartID, body.UserID, secret, body.CartName, body.HexColor); err != nil {

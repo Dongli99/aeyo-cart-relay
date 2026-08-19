@@ -374,3 +374,153 @@ func TestMembershipHandlersRefuseAKeylessRequest(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// create: the client may propose the room's id
+// ---------------------------------------------------------------------------
+
+// createTestDB is a bare database — create needs no fixture, which is the point
+// of it being the bootstrap endpoint.
+func createTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := InitDB(filepath.Join(t.TempDir(), "create.db"))
+	if err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func postCreate(t *testing.T, db *sql.DB, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	r := httptest.NewRequest("POST", "/api/cart/create", bytes.NewReader(raw))
+	w := httptest.NewRecorder()
+	createCartHandler(db)(w, r)
+	return w
+}
+
+func createdCartID(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var got map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal %q: %v", w.Body.String(), err)
+	}
+	return got["cartID"]
+}
+
+// A client that sends no cartID — every 1.7.6 client, and every ordinary first
+// share — must be unaffected by the field existing. This is the compatibility
+// assertion the rollout rests on.
+func TestCreateMintsAnIDWhenTheClientProposesNone(t *testing.T) {
+	db := createTestDB(t)
+
+	w := postCreate(t, db, map[string]any{"userID": "alice", "cartName": "Groceries"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create without cartID = %d, want 200 (body %q)", w.Code, w.Body.String())
+	}
+	id := createdCartID(t, w)
+	if !isValidCartID(id) {
+		t.Errorf("minted cartID %q is not a well-formed cart id", id)
+	}
+	if exists, _ := RoomExists(db, id); !exists {
+		t.Errorf("room %q was not created", id)
+	}
+}
+
+// The repair case: a cart whose room is gone re-creates it UNDER ITS OWN uuid, so
+// the id the client already uses everywhere never has to move.
+func TestCreateUsesAFreeProposedID(t *testing.T) {
+	db := createTestDB(t)
+	proposed := newUUID()
+
+	w := postCreate(t, db, map[string]any{"userID": "alice", "cartID": proposed})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create with free cartID = %d, want 200 (body %q)", w.Code, w.Body.String())
+	}
+	if got := createdCartID(t, w); got != proposed {
+		t.Errorf("cartID = %q, want the proposed %q", got, proposed)
+	}
+	owner, err := GetOwner(db, proposed)
+	if err != nil || owner != "alice" {
+		t.Errorf("owner of proposed room = %q, %v; want alice", owner, err)
+	}
+	if _, err := GetSubKey(db, proposed, "alice"); err != nil {
+		t.Errorf("proposing an id must still mint the caller's key: %v", err)
+	}
+}
+
+// The clause the whole proposal rests on: a live room is never adopted, re-owned,
+// or re-secreted. Every member of a cart knows its id, so this refusal is what
+// stops an ex-member walking back in as owner.
+func TestCreateRefusesAProposedIDThatIsTaken(t *testing.T) {
+	db := createTestDB(t)
+	taken := newUUID()
+	if err := CreateRoom(db, taken, "alice", "alices-secret", "Groceries", "#fff"); err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+
+	w := postCreate(t, db, map[string]any{"userID": "mallory", "cartID": taken})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("create with taken cartID = %d, want 409 (body %q)", w.Code, w.Body.String())
+	}
+	owner, err := GetOwner(db, taken)
+	if err != nil || owner != "alice" {
+		t.Errorf("owner = %q, %v; the refused create must not have re-owned the room", owner, err)
+	}
+	secret, err := GetSecret(db, taken)
+	if err != nil || secret != "alices-secret" {
+		t.Errorf("secret = %q, %v; the refused create must not have rotated it", secret, err)
+	}
+}
+
+// A proposed id whose room is gone but whose rows are not. Unreachable while the
+// cascade fires — the test constructs it by deleting the room with foreign keys
+// off, which is precisely the state a future MaxOpenConns bump would produce for
+// real. The refusal is what keeps "create touches no existing data" true without
+// resting on the pragma.
+func TestCreateRefusesAProposedIDWithSurvivingRows(t *testing.T) {
+	db := createTestDB(t)
+	orphaned := newUUID()
+	if err := CreateRoom(db, orphaned, "alice", "s", "Groceries", "#fff"); err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+	if _, err := AddMember(db, orphaned, "alice"); err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		t.Fatalf("pragma off: %v", err)
+	}
+	if err := DeleteRoom(db, orphaned); err != nil {
+		t.Fatalf("DeleteRoom: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		t.Fatalf("pragma on: %v", err)
+	}
+	if residue, _ := CartIDResidue(db, orphaned); !residue {
+		t.Fatal("fixture is not the state under test: no rows survived the room")
+	}
+
+	w := postCreate(t, db, map[string]any{"userID": "mallory", "cartID": orphaned})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("create with orphaned-row cartID = %d, want 409 (body %q)", w.Code, w.Body.String())
+	}
+	if exists, _ := RoomExists(db, orphaned); exists {
+		t.Error("the refused create must not have made a room over the surviving rows")
+	}
+}
+
+// A proposed id is a cart id, not free text: it reaches the same shape check that
+// join applies, so a proposal cannot smuggle in a key of another shape.
+func TestCreateRefusesAMalformedProposedID(t *testing.T) {
+	db := createTestDB(t)
+	for _, bad := range []string{"not-a-uuid", "ABCDEF01-2345-6789-ABCD-EF0123456789", "../../etc/passwd"} {
+		w := postCreate(t, db, map[string]any{"userID": "alice", "cartID": bad})
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("create with cartID %q = %d, want 400 (body %q)", bad, w.Code, w.Body.String())
+		}
+	}
+}
