@@ -38,6 +38,7 @@ const itemsTableBody = `
     deferred_guess_date REAL,
     deferred_guess_authored_at REAL,
     purchased_at  REAL,
+    purchase_store_brand TEXT,
     category_hint_name  TEXT,
     category_hint_icon  TEXT,
     category_hint_color TEXT,
@@ -129,6 +130,13 @@ var itemFactColumns = []struct{ name, ddl string }{
 	{"deferred_guess_date", "ALTER TABLE items ADD COLUMN deferred_guess_date REAL"},
 	{"deferred_guess_authored_at", "ALTER TABLE items ADD COLUMN deferred_guess_authored_at REAL"}, // ADR-053 anchor authorship time
 	{"purchased_at", "ALTER TABLE items ADD COLUMN purchased_at REAL"},                             // ADR-050 purchase fact time
+	// The BRAND NAME of the shop a member bought at, riding the same checked-carrying ops as
+	// purchased_at. It exists because a store RECORD never crosses this relay — stores are personal —
+	// so a receiving device has nothing it could resolve for a partner's trip, and naming its own shop
+	// would be inventing one. Stored so the fact survives the receiver being offline, exactly like
+	// purchased_at: the app settles a purchase into history up to a day after the tap, and by then the
+	// op is long gone.
+	{"purchase_store_brand", "ALTER TABLE items ADD COLUMN purchase_store_brand TEXT"},
 	// ADR-051 label hints — the sender's category/store labels, a receiver-side hydration backstop.
 	{"category_hint_name", "ALTER TABLE items ADD COLUMN category_hint_name TEXT"},
 	{"category_hint_icon", "ALTER TABLE items ADD COLUMN category_hint_icon TEXT"},
@@ -229,6 +237,7 @@ func migrateItemsCompositeKey(db *sql.DB) error {
 	const cols = `id, cart_id, title, quantity, checked, notes, specification,
 		urgency_level, global_id, frequency_days, is_active, paused_at,
 		pause_reason, deferred_guess_date, deferred_guess_authored_at, purchased_at,
+		purchase_store_brand,
 		category_hint_name, category_hint_icon, category_hint_color, store_hint_brand,
 		last_wanted_at, quiet_until_first_purchase,
 		attributed_to, ts, device_id, deleted, deleted_at`
@@ -534,6 +543,7 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 		       notes, specification, COALESCE(urgency_level,1),
 		       global_id, frequency_days, COALESCE(is_active,1),
 		       paused_at, pause_reason, deferred_guess_date, deferred_guess_authored_at, purchased_at,
+		       purchase_store_brand,
 		       category_hint_name, category_hint_icon, category_hint_color, store_hint_brand,
 		       last_wanted_at, COALESCE(quiet_until_first_purchase,0)
 		FROM items
@@ -558,6 +568,7 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 		var deferredGuessDate sql.NullFloat64
 		var deferredGuessAuthoredAt sql.NullFloat64
 		var purchasedAt sql.NullFloat64
+		var purchaseStoreBrand sql.NullString
 		var categoryHintName sql.NullString
 		var categoryHintIcon sql.NullString
 		var categoryHintColor sql.NullString
@@ -569,6 +580,7 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 			&notes, &specification, &item.UrgencyLevel,
 			&globalID, &frequencyDays, &item.IsActive,
 			&pausedAt, &pauseReason, &deferredGuessDate, &deferredGuessAuthoredAt, &purchasedAt,
+			&purchaseStoreBrand,
 			&categoryHintName, &categoryHintIcon, &categoryHintColor, &storeHintBrand,
 			&lastWantedAt, &item.QuietUntilFirstPurchase,
 		); err != nil {
@@ -604,6 +616,9 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 		}
 		if purchasedAt.Valid {
 			item.PurchasedAt = &purchasedAt.Float64
+		}
+		if purchaseStoreBrand.Valid {
+			item.PurchaseStoreBrand = &purchaseStoreBrand.String
 		}
 		if categoryHintName.Valid {
 			item.CategoryHintName = &categoryHintName.String
@@ -939,6 +954,10 @@ func insertItem(
 	if v, ok := fields["purchasedAt"]; ok {
 		purchasedAt = v
 	}
+	var purchaseStoreBrand any
+	if v, ok := fields["purchaseStoreBrand"]; ok {
+		purchaseStoreBrand = v
+	}
 	// ADR-051: the sender's label hints ride the add-op birth snapshot; persisted so state rows carry
 	// them for joiners. Present-keys-only, like every other field here — an absent key stays NULL.
 	var categoryHintName any
@@ -989,14 +1008,15 @@ func insertItem(
 		INSERT INTO items
 		    (id, cart_id, title, quantity, checked, notes, specification, urgency_level,
 		     global_id, frequency_days, is_active, paused_at, pause_reason, deferred_guess_date,
-		     deferred_guess_authored_at, purchased_at, category_hint_name, category_hint_icon,
+		     deferred_guess_authored_at, purchased_at, purchase_store_brand,
+		     category_hint_name, category_hint_icon,
 		     category_hint_color, store_hint_brand, last_wanted_at, quiet_until_first_purchase,
 		     attributed_to, ts, device_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, itemID, cartID, title, quantity, boolToInt(checked),
 		notes, specification, urgencyLevel,
 		globalID, frequencyDays, boolToInt(isActive), pausedAt, pauseReason, deferredGuessDate,
-		deferredGuessAuthoredAt, purchasedAt, categoryHintName, categoryHintIcon,
+		deferredGuessAuthoredAt, purchasedAt, purchaseStoreBrand, categoryHintName, categoryHintIcon,
 		categoryHintColor, storeHintBrand, lastWantedAt, boolToInt(quietUntilFirstPurchase),
 		attrParam, ts, deviceID)
 	return err == nil, err
@@ -1144,6 +1164,14 @@ func updateItem(
 	// by an unchecked op — the field is simply absent there, leaving the last recorded fact intact.
 	if v, ok := fields["purchasedAt"]; ok {
 		setClauses += ", purchased_at=?"
+		args = append(args, v)
+	}
+	// The store half of that same fact. Present-keys-only, and gated by the sender exactly as
+	// purchasedAt is: it rides only a checked-carrying op, so an unchecked op leaves the last recorded
+	// value alone rather than clearing it. The relay stores the string and never interprets it — a
+	// brand is a label a member typed or a catalog supplied, not an identifier this server resolves.
+	if v, ok := fields["purchaseStoreBrand"]; ok {
+		setClauses += ", purchase_store_brand=?"
 		args = append(args, v)
 	}
 	// ADR-051: a member's manual relabel enqueues a field-targeted hint update. Present-keys-only —

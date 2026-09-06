@@ -122,6 +122,14 @@ type ItemRow struct {
 	// omits it and the receiver falls back to Ts. State rows carry it so a reconnect snapshot,
 	// not only a live delta, delivers the fact (closing the state-door hole).
 	PurchasedAt *float64 `json:"purchasedAt,omitempty"`
+	// PurchaseStoreBrand is the BRAND NAME of the shop that purchase happened at, riding the same
+	// checked-carrying ops and rows as PurchasedAt. A store RECORD never crosses this relay — stores
+	// are personal — so this string is the only thing a receiving device can honestly say about where
+	// a household member shopped; resolving its own store for someone else's trip would invent a fact.
+	// The relay stores and returns it verbatim and never interprets it. omitempty: an unchecked row, a
+	// purchase with no store, and every row written before this column existed all omit the key, and an
+	// absent key means "that purchase's store is unknown" — never "reuse the last one".
+	PurchaseStoreBrand *string `json:"purchaseStoreBrand,omitempty"`
 	// Label hints (ADR-051): the sender's own category/store labels, carried so a receiver can
 	// fill its OWN blank fields once, as a backstop to receiver-side resolution — not synced state
 	// (category/store stay personal). Additive & absent-tolerant like PurchasedAt: old rows yield

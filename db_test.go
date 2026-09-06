@@ -336,6 +336,92 @@ func TestPurchaseFactColumnMigration(t *testing.T) {
 	}
 }
 
+// R-384: a pre-R-384 items table (no purchase_store_brand column) gains it on InitDB, a checked op
+// carrying the brand round-trips through the state door, and the present-keys-only rule holds in both
+// directions — an unchecked update leaves the recorded brand standing, and a later checked op at a
+// different shop replaces it.
+//
+// The last clause is the one worth a test rather than a comment: the brand names ONE purchase, so a
+// value that outlived its purchase would put a shop nobody visited on the next trip — two plausible
+// strings with nothing to tell them apart afterwards.
+func TestPurchaseStoreBrandColumnMigrationAndRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prebrand.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	if _, err := legacy.Exec(`
+		CREATE TABLE rooms (
+		    cart_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, secret TEXT NOT NULL,
+		    created_at REAL NOT NULL, cart_name TEXT NOT NULL DEFAULT '', hex_color TEXT NOT NULL DEFAULT ''
+		);
+		CREATE TABLE items (
+		    id TEXT NOT NULL, cart_id TEXT NOT NULL, title TEXT, quantity INTEGER DEFAULT 1,
+		    checked INTEGER DEFAULT 0, notes TEXT, specification TEXT, urgency_level INTEGER DEFAULT 1,
+		    global_id TEXT, frequency_days INTEGER, is_active INTEGER DEFAULT 1, paused_at REAL,
+		    pause_reason TEXT, deferred_guess_date REAL, purchased_at REAL, attributed_to TEXT,
+		    ts REAL NOT NULL, device_id TEXT, deleted INTEGER DEFAULT 0, deleted_at REAL,
+		    PRIMARY KEY (cart_id, id), FOREIGN KEY (cart_id) REFERENCES rooms(cart_id) ON DELETE CASCADE
+		);
+		INSERT INTO rooms VALUES ('cart-a','user-a','s',1,'A','');
+	`); err != nil {
+		t.Fatalf("seed pre-brand schema: %v", err)
+	}
+	legacy.Close()
+
+	db, err := InitDB(path)
+	if err != nil {
+		t.Fatalf("InitDB on pre-brand db: %v", err)
+	}
+	defer db.Close()
+
+	cols, err := existingColumns(db, "items")
+	if err != nil {
+		t.Fatalf("existingColumns: %v", err)
+	}
+	if !cols["purchase_store_brand"] {
+		t.Fatal("migration did not add the purchase_store_brand column")
+	}
+
+	// (a) A checked `add` carrying the brand round-trips through the state door.
+	pa := 1_700_000_000.0
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+		map[string]any{"title": "Milk", "checked": true, "purchasedAt": pa, "purchaseStoreBrand": "FreshCo"},
+		1_700_050_000, "dev-1", "user-a"); err != nil || !ok {
+		t.Fatalf("add carrying purchaseStoreBrand: ok=%v err=%v", ok, err)
+	}
+	items, err := GetItems(db, "cart-a")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("GetItems: err=%v n=%d", err, len(items))
+	}
+	if items[0].PurchaseStoreBrand == nil || *items[0].PurchaseStoreBrand != "FreshCo" {
+		t.Errorf("state row purchaseStoreBrand = %v, want FreshCo (the brand must ride state rows)", items[0].PurchaseStoreBrand)
+	}
+
+	// (b) An unchecked update omits the key entirely — present-keys-only leaves the recorded brand alone.
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"title": "Whole Milk"},
+		1_700_060_000, "dev-1", "user-a"); err != nil || !ok {
+		t.Fatalf("unchecked update: ok=%v err=%v", ok, err)
+	}
+	items, _ = GetItems(db, "cart-a")
+	if items[0].PurchaseStoreBrand == nil || *items[0].PurchaseStoreBrand != "FreshCo" {
+		t.Errorf("an absent key cleared the brand: %v — present-keys-only means unchanged", items[0].PurchaseStoreBrand)
+	}
+
+	// (c) A later purchase at a different shop replaces it. The brand names one purchase; it must not
+	// accumulate or stick.
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"checked": true, "purchasedAt": pa + 604_800, "purchaseStoreBrand": "Costco"},
+		1_700_700_000, "dev-1", "user-a"); err != nil || !ok {
+		t.Fatalf("second checked update: ok=%v err=%v", ok, err)
+	}
+	items, _ = GetItems(db, "cart-a")
+	if items[0].PurchaseStoreBrand == nil || *items[0].PurchaseStoreBrand != "Costco" {
+		t.Errorf("purchaseStoreBrand = %v, want Costco — the brand names THIS purchase", items[0].PurchaseStoreBrand)
+	}
+}
+
 // ADR-053: a pre-ADR-053 items table (no deferred_guess_authored_at column) gains it on InitDB; a
 // field-targeted anchor update then carries the anchor/authored-at PAIR, both persist, and the state
 // door (GetItems) returns the pair — the fact every device needs to derive consumption without a synced
