@@ -665,6 +665,94 @@ func TestLabelHintFieldUpdate(t *testing.T) {
 	}
 }
 
+// stateAttributedTo reads attributed_to the way a client does — through the state door (GetItems),
+// where NULL surfaces as a nil pointer.
+func stateAttributedTo(t *testing.T, db *sql.DB, cartID, itemID string) *string {
+	t.Helper()
+	items, err := GetItems(db, cartID)
+	if err != nil {
+		t.Fatalf("GetItems: %v", err)
+	}
+	for _, it := range items {
+		if it.ID == itemID {
+			return it.AttributedTo
+		}
+	}
+	t.Fatalf("item %s not in state for cart %s", itemID, cartID)
+	return nil
+}
+
+// R-468 (a) — the regression. attributed_to means "who checked this off", and an op that says
+// nothing about completion must not move it. A rename by another member used to overwrite the
+// checker, and the next state snapshot then named the wrong buyer (durable since ADR-079's
+// PurchaseEvent.buyer). The two test suites — Swift receiver-door, Go LWW — meet nowhere, so
+// this is the first thing that crosses the seam.
+func TestAttributedToSurvivesAnEditByAnotherMember(t *testing.T) {
+	db := testDB(t)
+
+	// A checks the item off.
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+		map[string]any{"title": "Milk"}, 1000, "dev-a", "user-a"); err != nil || !ok {
+		t.Fatalf("add: ok=%v err=%v", ok, err)
+	}
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"checked": true}, 2000, "dev-a", "user-a"); err != nil || !ok {
+		t.Fatalf("check off: ok=%v err=%v", ok, err)
+	}
+	if got := stateAttributedTo(t, db, "cart-a", "item-1"); got == nil || *got != "user-a" {
+		t.Fatalf("after check-off attributed_to = %v, want user-a", got)
+	}
+
+	// B renames it. This asserts nothing about who bought it.
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"title": "Whole Milk"}, 3000, "dev-b", "user-b"); err != nil || !ok {
+		t.Fatalf("rename: ok=%v err=%v", ok, err)
+	}
+	if got := stateAttributedTo(t, db, "cart-a", "item-1"); got == nil || *got != "user-a" {
+		t.Errorf("a rename by user-b changed the completer to %v, want it untouched at user-a", got)
+	}
+
+	// A quantity change by B — same story.
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"quantity": 2.0}, 4000, "dev-b", "user-b"); err != nil || !ok {
+		t.Fatalf("quantity change: ok=%v err=%v", ok, err)
+	}
+	if got := stateAttributedTo(t, db, "cart-a", "item-1"); got == nil || *got != "user-a" {
+		t.Errorf("a quantity change by user-b changed the completer to %v, want user-a", got)
+	}
+}
+
+// R-468 (b) — the completer moves with, and only with, an op that asserts completion.
+func TestAttributedToTracksTheCheckedAssertion(t *testing.T) {
+	db := testDB(t)
+
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+		map[string]any{"title": "Milk"}, 1000, "dev-a", "user-a"); err != nil || !ok {
+		t.Fatalf("add: ok=%v err=%v", ok, err)
+	}
+	if got := stateAttributedTo(t, db, "cart-a", "item-1"); got != nil {
+		t.Fatalf("a fresh unchecked add has a completer %v, want none", got)
+	}
+
+	// checked:true — the asserting actor becomes the completer.
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"checked": true}, 2000, "dev-b", "user-b"); err != nil || !ok {
+		t.Fatalf("check off: ok=%v err=%v", ok, err)
+	}
+	if got := stateAttributedTo(t, db, "cart-a", "item-1"); got == nil || *got != "user-b" {
+		t.Errorf("checked:true by user-b: completer = %v, want user-b", got)
+	}
+
+	// checked:false — the completion is retracted, so is the completer.
+	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"checked": false}, 3000, "dev-a", "user-a"); err != nil || !ok {
+		t.Fatalf("uncheck: ok=%v err=%v", ok, err)
+	}
+	if got := stateAttributedTo(t, db, "cart-a", "item-1"); got != nil {
+		t.Errorf("checked:false: completer = %v, want none", got)
+	}
+}
+
 // ADR-050 (c): an old client that omits purchasedAt falls back to the row ts — today's behaviour.
 func TestCaptureConsumptionFallsBackToTs(t *testing.T) {
 	db := testDB(t)

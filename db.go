@@ -989,19 +989,13 @@ func insertItem(
 		quietUntilFirstPurchase = v
 	}
 
-	attributedTo := userID
-	// Uncheck clears attribution (§3.3 attribution rule).
-	if op == "update" {
-		if c, ok := fields["checked"].(bool); ok && !c && len(fields) == 1 {
-			attributedTo = ""
-		}
-	}
-
+	// Same rule as updateItem: attributed_to is the completer, so it is set only when
+	// this birth op asserts the item is checked. A fresh row has no standing completer,
+	// so where updateItem omits the column, here the natural value is NULL — there is
+	// nothing to preserve.
 	var attrParam any
-	if attributedTo == "" {
-		attrParam = nil
-	} else {
-		attrParam = attributedTo
+	if checked {
+		attrParam = userID
 	}
 
 	_, err := db.Exec(`
@@ -1067,27 +1061,27 @@ func updateItem(
 	ts float64,
 	deviceID, userID string,
 ) (bool, error) {
-	// Determine attributed_to:
-	// - update with only {"checked": false} → NULL
-	// - all other ops/fields → userID
-	attributedTo := userID
-	if op == "update" {
-		if c, ok := fields["checked"].(bool); ok && !c && len(fields) == 1 {
-			attributedTo = ""
+	// Build SET clause from fields that are present.
+	// ts and device_id move on every op.
+	setClauses := "ts=?, device_id=?"
+	args := []any{ts, deviceID}
+
+	// attributed_to holds the COMPLETER of this purchase, not the actor of this op.
+	// So it moves only with an op that asserts something about completion:
+	//   - "checked": true   → this actor is the completer
+	//   - "checked": false  → the completion is retracted; no completer
+	//   - no "checked" key   → a rename, a quantity change, a recordQuiet says nothing
+	//     about who bought the item — leave the standing completer untouched by
+	//     omitting the column. (Writing NULL here is the bug this fix removes: it let
+	//     the last editor overwrite the checker.)
+	if c, ok := fields["checked"].(bool); ok {
+		setClauses += ", attributed_to=?"
+		if c {
+			args = append(args, userID)
+		} else {
+			args = append(args, nil)
 		}
 	}
-
-	var attrParam any
-	if attributedTo == "" {
-		attrParam = nil
-	} else {
-		attrParam = attributedTo
-	}
-
-	// Build SET clause from fields that are present.
-	// We always update ts, device_id, and attributed_to.
-	setClauses := "ts=?, device_id=?, attributed_to=?"
-	args := []any{ts, deviceID, attrParam}
 
 	// Only a deliberate re-add (op=="add") may clear a tombstone; an update must
 	// never resurrect (ADR-039). ApplyLWW already blocks update-over-tombstone,
