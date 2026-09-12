@@ -508,11 +508,23 @@ func RemoveMember(db *sql.DB, cartID, userID string) error {
 }
 
 // GetMembers returns all members of a cart with their user metadata.
+//
+// Tier is reported for the cart OWNER only; every other member's tier comes back
+// as the empty string. The owner's plan is the one a client acts on (it decides
+// whether a shared cart is frozen), and nothing reads anyone else's — so nobody
+// else's is sent. A plan is not a secret; this is simply not broadcasting a fact
+// that has no reader.
+//
+// The join to rooms is a LEFT join so that a cart whose room row is missing still
+// returns its members (with no tier) rather than none: losing the member list is a
+// far worse failure than losing a tier, and it would be a silent one.
 func GetMembers(db *sql.DB, cartID string) ([]MemberInfo, error) {
 	rows, err := db.Query(`
-		SELECT u.user_id, COALESCE(u.display_name,''), COALESCE(u.color,''), u.tier
+		SELECT u.user_id, COALESCE(u.display_name,''), COALESCE(u.color,''),
+		       CASE WHEN u.user_id = r.owner_id THEN u.tier ELSE '' END
 		FROM members m
 		JOIN users u ON m.user_id = u.user_id
+		LEFT JOIN rooms r ON r.cart_id = m.cart_id
 		WHERE m.cart_id = ?
 		ORDER BY m.joined_at ASC
 	`, cartID)

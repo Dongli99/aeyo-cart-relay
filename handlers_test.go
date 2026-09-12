@@ -524,3 +524,200 @@ func TestCreateRefusesAMalformedProposedID(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// premiumForAll narrows with GetMembers
+// ---------------------------------------------------------------------------
+
+// AEYO_PREMIUM_FOR_ALL is the TestFlight bypass: it rewrites the broadcast tier so
+// the client's optimistic frozen check clears. That check reads the owner's row, so
+// the owner's row is the only one it may rewrite — a bypass that wrote every row
+// would put back the very broadcast GetMembers stops making, in the build most
+// testers are running.
+
+// stateMembers builds a state message for a cart and returns its members.
+func stateMembers(t *testing.T, db *sql.DB, cartID string) []MemberInfo {
+	t.Helper()
+	return buildStateMsg(db, NewHub(), cartID).Members
+}
+
+// premiumCart gives cart-p a free owner (owner-p) and a free second member (peer-p).
+func premiumCart(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, u := range []string{"owner-p", "peer-p"} {
+		if err := UpsertUser(db, u, u, "#fff"); err != nil {
+			t.Fatalf("UpsertUser %s: %v", u, err)
+		}
+	}
+	if err := CreateRoom(db, "cart-p", "owner-p", "secret-p", "Cart P", "#fff"); err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+	for _, u := range []string{"owner-p", "peer-p"} {
+		if _, err := AddMember(db, "cart-p", u); err != nil {
+			t.Fatalf("AddMember %s: %v", u, err)
+		}
+	}
+}
+
+func TestPremiumForAllRewritesTheOwnersRowOnly(t *testing.T) {
+	db := createTestDB(t)
+	premiumCart(t, db)
+
+	was := premiumForAll
+	premiumForAll = true
+	t.Cleanup(func() { premiumForAll = was })
+
+	members := stateMembers(t, db, "cart-p")
+	if len(members) != 2 {
+		t.Fatalf("got %d members, want 2", len(members))
+	}
+	for _, m := range members {
+		switch m.UserID {
+		case "owner-p":
+			if m.Tier != "premium" {
+				t.Errorf("owner's tier = %q, want %q — the frozen check must clear", m.Tier, "premium")
+			}
+		case "peer-p":
+			if m.Tier != "" {
+				t.Errorf("non-owner's tier = %q, want %q — the bypass is not a licence to broadcast", m.Tier, "")
+			}
+		default:
+			t.Errorf("unexpected member %q", m.UserID)
+		}
+	}
+}
+
+// With the bypass off, the owner's real plan is what ships — the bypass is the only
+// thing that ever substitutes a value for it.
+func TestWithoutPremiumForAllTheOwnersRealTierShips(t *testing.T) {
+	db := createTestDB(t)
+	premiumCart(t, db)
+
+	was := premiumForAll
+	premiumForAll = false
+	t.Cleanup(func() { premiumForAll = was })
+
+	members := stateMembers(t, db, "cart-p")
+	for _, m := range members {
+		switch m.UserID {
+		case "owner-p":
+			if m.Tier != "free" {
+				t.Errorf("owner's tier = %q, want %q", m.Tier, "free")
+			}
+		case "peer-p":
+			if m.Tier != "" {
+				t.Errorf("non-owner's tier = %q, want %q", m.Tier, "")
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// An ownership change is now a tier change, so it owes a state message
+// ---------------------------------------------------------------------------
+
+// GetMembers reports a tier for the owner and an empty string for everyone else.
+// That makes the field ownership-dependent: the moment ownership moves, two rows'
+// tiers are wrong on every client. `owner_transferred` carries no member array, and
+// a client applying it only rewrites who the owner is — so without a fresh snapshot
+// the new owner keeps the empty tier they held as an ordinary member, and the
+// client's frozen check reads a free owner as unfrozen until some unrelated write
+// happens to produce a state message.
+
+// drainStates returns every state message queued on a client, in order.
+func drainStates(t *testing.T, c *Client) []StateMsg {
+	t.Helper()
+	var states []StateMsg
+	for {
+		select {
+		case b := <-c.send:
+			var probe struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(b, &probe); err != nil || probe.Type != "state" {
+				continue
+			}
+			var s StateMsg
+			if err := json.Unmarshal(b, &s); err != nil {
+				t.Fatalf("unmarshal state: %v", err)
+			}
+			states = append(states, s)
+		default:
+			return states
+		}
+	}
+}
+
+// tierOf returns the tier a state message reported for one member.
+func tierOf(t *testing.T, s StateMsg, userID string) (string, bool) {
+	t.Helper()
+	for _, m := range s.Members {
+		if m.UserID == userID {
+			return m.Tier, true
+		}
+	}
+	return "", false
+}
+
+func TestTransferBroadcastsStateSoTheNewOwnersTierArrives(t *testing.T) {
+	db, cartA, _, keyAliceA, _, _ := subTestDB(t)
+	hub := NewHub()
+	watcher := joinHub(hub, newTestClient("bob", "dev-1"), cartA)
+
+	w := postJSON(t, transferHandler(db, hub), cartA, keyAliceA,
+		map[string]any{"cartID": cartA, "newOwnerID": "bob"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("transfer: status = %d (body %q)", w.Code, w.Body.String())
+	}
+
+	states := drainStates(t, watcher)
+	if len(states) == 0 {
+		t.Fatal("no state message followed owner_transferred — the new owner's tier never arrives")
+	}
+	last := states[len(states)-1]
+
+	if tier, found := tierOf(t, last, "bob"); !found {
+		t.Error("the new owner is missing from the state message")
+	} else if tier != "free" {
+		t.Errorf("new owner's tier = %q, want %q — the frozen check reads this row", tier, "free")
+	}
+	if tier, found := tierOf(t, last, "alice"); !found {
+		t.Error("the former owner is missing from the state message")
+	} else if tier != "" {
+		t.Errorf("former owner's tier = %q, want %q — she is an ordinary member now", tier, "")
+	}
+}
+
+// The leave path's transfer is a side effect of someone leaving rather than the
+// point of the call, which makes it the one more likely to be missed. It carries a
+// second requirement the explicit handler does not: the snapshot must be taken
+// AFTER the leaver's row is gone, or it re-asserts the member the call removed.
+func TestLeaveBroadcastsStateAfterTheOwnerHandsOffAndGoes(t *testing.T) {
+	db, cartA, _, keyAliceA, _, _ := subTestDB(t)
+	hub := NewHub()
+	watcher := joinHub(hub, newTestClient("bob", "dev-1"), cartA)
+
+	w := postJSON(t, leaveCartHandler(db, hub), cartA, keyAliceA,
+		map[string]any{"cartID": cartA})
+	if w.Code != http.StatusOK {
+		t.Fatalf("owner leaving: status = %d (body %q)", w.Code, w.Body.String())
+	}
+	if owner, _ := GetOwner(db, cartA); owner != "bob" {
+		t.Fatalf("ownership did not auto-transfer: owner = %q, want bob", owner)
+	}
+
+	states := drainStates(t, watcher)
+	if len(states) == 0 {
+		t.Fatal("no state message followed the hand-off — the new owner's tier never arrives")
+	}
+	last := states[len(states)-1]
+
+	if tier, found := tierOf(t, last, "bob"); !found {
+		t.Error("the new owner is missing from the state message")
+	} else if tier != "free" {
+		t.Errorf("new owner's tier = %q, want %q", tier, "free")
+	}
+	if _, found := tierOf(t, last, "alice"); found {
+		t.Error("the leaver is still in the state message — the snapshot was taken before her row was removed")
+	}
+}

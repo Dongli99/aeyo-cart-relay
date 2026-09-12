@@ -8,8 +8,9 @@ import (
 )
 
 // premiumForAll, when AEYO_PREMIUM_FOR_ALL=true, treats every cart owner as premium: the join
-// capacity check is bypassed and every member's tier is reported as "premium" in state messages
-// (which also clears the client's optimistic frozen check). TestFlight-only — unset the env var and
+// capacity check is bypassed and the owner's tier is reported as "premium" in state messages
+// (which also clears the client's optimistic frozen check, the one reader of that field).
+// TestFlight-only — unset the env var and
 // restart to reinstate per-tier limits. StoreKit-validated premium is the production path
 // (Family Sharing TDD §4.9 / security table).
 var premiumForAll bool

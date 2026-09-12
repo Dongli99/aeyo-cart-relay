@@ -1198,3 +1198,151 @@ func TestDeleteRoomCascadesToEveryDependentTable(t *testing.T) {
 		t.Errorf("cart-b rooms = %d, want 1", others)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// GetMembers reports one member's tier: the owner's
+// ---------------------------------------------------------------------------
+
+// A subscription plan rides every state message to everyone in the cart, and the
+// only thing that ever reads one is the client's frozen check, which reads the
+// OWNER's. These tests hold the narrowing: the owner's plan is sent because
+// something reads it, and nobody else's is sent because nothing does.
+
+func setTier(t *testing.T, db *sql.DB, userID, tier string) {
+	t.Helper()
+	if _, err := db.Exec(`UPDATE users SET tier=? WHERE user_id=?`, tier, userID); err != nil {
+		t.Fatalf("set tier for %s: %v", userID, err)
+	}
+}
+
+// memberTier returns the tier GetMembers reported for one member, and whether
+// that member came back at all.
+func memberTier(t *testing.T, db *sql.DB, cartID, userID string) (string, bool) {
+	t.Helper()
+	members, err := GetMembers(db, cartID)
+	if err != nil {
+		t.Fatalf("GetMembers: %v", err)
+	}
+	for _, m := range members {
+		if m.UserID == userID {
+			return m.Tier, true
+		}
+	}
+	return "", false
+}
+
+// twoMemberCart gives cart-a an owner (user-a) and a second member (user-b).
+func twoMemberCart(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if err := UpsertUser(db, "user-b", "B", "#000"); err != nil {
+		t.Fatalf("UpsertUser b: %v", err)
+	}
+	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
+		t.Fatalf("AddMember a: %v", err)
+	}
+	if _, err := AddMember(db, "cart-a", "user-b"); err != nil {
+		t.Fatalf("AddMember b: %v", err)
+	}
+}
+
+func TestGetMembersReportsTheOwnersTier(t *testing.T) {
+	db := testDB(t)
+	twoMemberCart(t, db)
+	setTier(t, db, "user-a", "premium")
+
+	tier, found := memberTier(t, db, "cart-a", "user-a")
+	if !found {
+		t.Fatal("the owner is missing from GetMembers")
+	}
+	if tier != "premium" {
+		t.Errorf("owner's tier = %q, want %q — the frozen check reads this row", tier, "premium")
+	}
+}
+
+func TestGetMembersWithholdsANonOwnersTier(t *testing.T) {
+	db := testDB(t)
+	twoMemberCart(t, db)
+	setTier(t, db, "user-b", "premium")
+
+	tier, found := memberTier(t, db, "cart-a", "user-b")
+	if !found {
+		t.Fatal("the non-owner is missing from GetMembers")
+	}
+	if tier != "" {
+		t.Errorf("non-owner's tier = %q, want %q — nothing reads it, so nothing sends it", tier, "")
+	}
+}
+
+// A free owner is the state the frozen check exists to detect, so "free" has to
+// arrive as itself and not be flattened into the same empty string that stands
+// for "withheld".
+func TestGetMembersSendsAFreeOwnersTierAsItself(t *testing.T) {
+	db := testDB(t)
+	twoMemberCart(t, db)
+	setTier(t, db, "user-a", "free")
+
+	tier, _ := memberTier(t, db, "cart-a", "user-a")
+	if tier != "free" {
+		t.Errorf("free owner's tier = %q, want %q", tier, "free")
+	}
+}
+
+// When the owner leaves a cart nobody else can inherit, the room keeps pointing
+// at them while they are no longer a member. Every remaining member is then a
+// non-owner, so no tier is reported at all — and crucially the member list still
+// comes back.
+func TestGetMembersWhenTheOwnerIsNoLongerAMember(t *testing.T) {
+	db := testDB(t)
+	twoMemberCart(t, db)
+	setTier(t, db, "user-a", "premium")
+	setTier(t, db, "user-b", "premium")
+	if err := RemoveMember(db, "cart-a", "user-a"); err != nil {
+		t.Fatalf("RemoveMember: %v", err)
+	}
+
+	members, err := GetMembers(db, "cart-a")
+	if err != nil {
+		t.Fatalf("GetMembers: %v", err)
+	}
+	if len(members) != 1 {
+		t.Fatalf("got %d members, want 1", len(members))
+	}
+	if members[0].UserID != "user-b" {
+		t.Fatalf("got member %q, want user-b", members[0].UserID)
+	}
+	if members[0].Tier != "" {
+		t.Errorf("tier = %q, want %q — the departed owner's row is the only one anyone reads", members[0].Tier, "")
+	}
+}
+
+// The tier join must never be able to cost us the member list. GetMembers reaches
+// rooms only to learn who the owner is, and InitDB's own comment records that the
+// foreign key protecting that row is a per-connection pragma one pool change away
+// from being off. So: no room row, still every member — with no tier.
+func TestGetMembersSurvivesAMissingRoomRow(t *testing.T) {
+	db := testDB(t)
+	twoMemberCart(t, db)
+
+	if _, err := db.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		t.Fatalf("pragma off: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM rooms WHERE cart_id = 'cart-a'`); err != nil {
+		t.Fatalf("delete room: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		t.Fatalf("pragma on: %v", err)
+	}
+
+	members, err := GetMembers(db, "cart-a")
+	if err != nil {
+		t.Fatalf("GetMembers: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("got %d members, want 2 — a missing room must not empty the member list", len(members))
+	}
+	for _, m := range members {
+		if m.Tier != "" {
+			t.Errorf("%s: tier = %q, want %q — with no room there is no owner to report", m.UserID, m.Tier, "")
+		}
+	}
+}

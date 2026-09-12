@@ -334,6 +334,7 @@ func leaveCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 			return
 		}
 
+		transferred := false
 		if leaverID == ownerID {
 			// Determine new owner.
 			newOwner := body.TransferTo
@@ -375,6 +376,7 @@ func leaveCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 				}
 				b, _ := json.Marshal(msg)
 				hub.BroadcastToCart(body.CartID, b, "")
+				transferred = true
 			}
 		}
 
@@ -394,6 +396,17 @@ func leaveCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		// Exclude the leaver: they initiated the leave and self-reset client-side.
 		// Broadcasting member_removed to them would fire a false "you've been removed" insight.
 		hub.BroadcastToCartExcludeUser(body.CartID, rb, leaverID)
+
+		// A tier is reported for the owner and nobody else, so an ownership change IS a
+		// tier change and owes a fresh snapshot: owner_transferred carries no members, and
+		// a client that only rewrites who is owner would leave the new owner holding the
+		// empty tier they had as an ordinary member. Sent here rather than beside that
+		// broadcast because the leaver's row is gone by this point — a snapshot taken
+		// earlier would re-assert the member this call is removing.
+		if transferred {
+			stateB, _ := json.Marshal(buildStateMsg(db, hub, body.CartID))
+			hub.BroadcastToCart(body.CartID, stateB, "")
+		}
 
 		count, _ := GetMemberCount(db, body.CartID)
 		if count == 0 {
@@ -570,6 +583,13 @@ func transferHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		b, _ := json.Marshal(msg)
 		hub.BroadcastToCart(body.CartID, b, "")
 
+		// A tier is reported for the owner and nobody else, so an ownership change IS a
+		// tier change. owner_transferred carries no members, so without this the new owner
+		// keeps the empty tier they held as an ordinary member until some other write
+		// happens to produce a state message.
+		stateB, _ := json.Marshal(buildStateMsg(db, hub, body.CartID))
+		hub.BroadcastToCart(body.CartID, stateB, "")
+
 		writeJSON(w, http.StatusOK, map[string]any{})
 	}
 }
@@ -638,12 +658,17 @@ func buildStateMsg(db *sql.DB, hub *Hub, cartID string) StateMsg {
 		activeShopping = []ActiveShoppingEntry{}
 	}
 
-	// premiumForAll (TestFlight): report every member as premium so the client's optimistic frozen
-	// check (CartShareSheet.isCartFrozen) clears too. The join capacity check is bypassed separately;
-	// this only rewrites the broadcast state, leaving the DB and the hasPremiumOwner read untouched.
+	// premiumForAll (TestFlight): report the OWNER as premium so the client's optimistic frozen
+	// check (CartShareSheet.isCartFrozen) clears too. That check reads the owner's row and no
+	// other, so the owner's row is all there is to rewrite — rewriting every row would put back
+	// exactly the broadcast GetMembers stops making. The join capacity check is bypassed
+	// separately; this only rewrites the broadcast state, leaving the DB and the hasPremiumOwner
+	// read untouched.
 	if premiumForAll {
 		for i := range members {
-			members[i].Tier = "premium"
+			if members[i].UserID == ownerID {
+				members[i].Tier = "premium"
+			}
 		}
 	}
 
