@@ -1028,6 +1028,120 @@ func TestCompositeKeyRebuildCarriesWantedAndQuiet(t *testing.T) {
 	}
 }
 
+// R-549: the silence is a DERIVED fact, not a sticky one. No client ever puts `false` on the wire
+// for this key — the relay itself clears the persisted column when an op's purchasedAt or
+// lastWantedAt is strictly newer than the stored fact, so a build too old to ever send `false`
+// still heals at its next purchase or want. "Strictly newer", not "present": the anti-entropy
+// push-back re-asserts both facts unchanged on every reconnect, and a present-key rule would let
+// that re-assert undo a later ×.
+func TestQuietDerivedClear(t *testing.T) {
+	seed := func(t *testing.T, db *sql.DB) {
+		t.Helper()
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+			map[string]any{"title": "Sunscreen", "purchasedAt": 1000.0, "lastWantedAt": 1000.0,
+				"quietUntilFirstPurchase": true},
+			1000, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("seed quiet item: ok=%v err=%v", ok, err)
+		}
+	}
+	quietState := func(t *testing.T, db *sql.DB) bool {
+		t.Helper()
+		items, err := GetItems(db, "cart-a")
+		if err != nil || len(items) != 1 {
+			t.Fatalf("GetItems: err=%v n=%d", err, len(items))
+		}
+		return items[0].QuietUntilFirstPurchase
+	}
+
+	t.Run("a newer purchase clears", func(t *testing.T) {
+		db := testDB(t)
+		seed(t, db)
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+			map[string]any{"checked": true, "purchasedAt": 2000.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("purchase update: ok=%v err=%v", ok, err)
+		}
+		if quietState(t, db) {
+			t.Error("quiet still set after a strictly newer purchase")
+		}
+	})
+
+	t.Run("a re-asserted equal purchasedAt does not clear", func(t *testing.T) {
+		db := testDB(t)
+		seed(t, db)
+		// The anti-entropy push-back: re-asserts the same fact, unchanged.
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+			map[string]any{"checked": true, "purchasedAt": 1000.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("push-back update: ok=%v err=%v", ok, err)
+		}
+		if !quietState(t, db) {
+			t.Error("quiet cleared by a re-asserted equal purchasedAt — push-back must not undo the ×")
+		}
+	})
+
+	t.Run("a newer want clears", func(t *testing.T) {
+		db := testDB(t)
+		seed(t, db)
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+			map[string]any{"lastWantedAt": 2000.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("want update: ok=%v err=%v", ok, err)
+		}
+		if quietState(t, db) {
+			t.Error("quiet still set after a strictly newer want")
+		}
+	})
+
+	t.Run("an equal or older want does not clear", func(t *testing.T) {
+		db := testDB(t)
+		seed(t, db)
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+			map[string]any{"lastWantedAt": 1000.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("equal want update: ok=%v err=%v", ok, err)
+		}
+		if !quietState(t, db) {
+			t.Error("quiet cleared by an equal want")
+		}
+
+		db2 := testDB(t)
+		seed(t, db2)
+		if ok, err := ApplyLWW(db2, "cart-a", "item-1", "update",
+			map[string]any{"lastWantedAt": 500.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("older want update: ok=%v err=%v", ok, err)
+		}
+		if !quietState(t, db2) {
+			t.Error("quiet cleared by an older want")
+		}
+	})
+
+	t.Run("an explicit true in the same op wins over the derived clear", func(t *testing.T) {
+		db := testDB(t)
+		seed(t, db)
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+			map[string]any{"checked": true, "purchasedAt": 2000.0, "quietUntilFirstPurchase": true},
+			2000, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("purchase-with-explicit-quiet update: ok=%v err=%v", ok, err)
+		}
+		if !quietState(t, db) {
+			t.Error("explicit true did not win over the derived clear from the same op's newer purchase")
+		}
+	})
+
+	t.Run("the state read returns false after a clear", func(t *testing.T) {
+		db := testDB(t)
+		seed(t, db)
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+			map[string]any{"checked": true, "purchasedAt": 2000.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("purchase update: ok=%v err=%v", ok, err)
+		}
+		items, err := GetItems(db, "cart-a")
+		if err != nil || len(items) != 1 {
+			t.Fatalf("GetItems: err=%v n=%d", err, len(items))
+		}
+		if items[0].QuietUntilFirstPurchase != false {
+			t.Errorf("state door quietUntilFirstPurchase = %v, want false", items[0].QuietUntilFirstPurchase)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Member subscription keys
 // ---------------------------------------------------------------------------

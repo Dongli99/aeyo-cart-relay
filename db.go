@@ -1204,12 +1204,41 @@ func updateItem(
 		setClauses += ", last_wanted_at=?"
 		args = append(args, v)
 	}
-	// Set when a member asks for no predictions until the next purchase; cleared by the client sending
-	// false once that purchase happens. (The wire key says "first"; the meaning is the next purchase.)
+	// Set when a member asks for no predictions until the next purchase or the next Need Now,
+	// whichever comes first. An explicit key in THIS op is authoritative and wins outright — the
+	// derived clear below runs only when this op is silent on the flag.
+	_, explicitQuiet := fields["quietUntilFirstPurchase"]
 	if v, ok := fields["quietUntilFirstPurchase"]; ok {
 		if b, ok := coerceBool("quietUntilFirstPurchase", v); ok {
 			setClauses += ", quiet_until_first_purchase=?"
 			args = append(args, boolToInt(b))
+		}
+	}
+	// R-549: the silence is a derived fact, not a sticky one — a strictly newer purchase or want
+	// ends it, in the relay, so a build too old to ever send `false` still heals. "Strictly newer",
+	// not "present": the anti-entropy push-back re-asserts both facts unchanged on every reconnect,
+	// and a present-key rule would let that re-assert undo a later ×. SQLite evaluates every SET
+	// expression against the OLD row, so the comparison lives in the same UPDATE as the writes above.
+	if !explicitQuiet {
+		purchasedAtVal, hasPurchasedAt := fields["purchasedAt"]
+		lastWantedAtVal, hasLastWantedAt := fields["lastWantedAt"]
+		if hasPurchasedAt || hasLastWantedAt {
+			cond := ""
+			var condArgs []any
+			if hasPurchasedAt {
+				cond = "(purchased_at IS NULL OR ? > purchased_at)"
+				condArgs = append(condArgs, purchasedAtVal)
+			}
+			if hasLastWantedAt {
+				if cond != "" {
+					cond += " OR "
+				}
+				cond += "(last_wanted_at IS NULL OR ? > last_wanted_at)"
+				condArgs = append(condArgs, lastWantedAtVal)
+			}
+			setClauses += ", quiet_until_first_purchase = CASE WHEN " + cond +
+				" THEN 0 ELSE quiet_until_first_purchase END"
+			args = append(args, condArgs...)
 		}
 	}
 

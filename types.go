@@ -149,10 +149,16 @@ type ItemRow struct {
 	// it would invent one out of an unrelated edit, which is the whole failure this field exists to
 	// avoid: an item somebody merely renamed would look like an item somebody asked for.
 	LastWantedAt *float64 `json:"lastWantedAt,omitempty"`
-	// QuietUntilFirstPurchase means "make no prediction about this item until it is next purchased" —
-	// a member's explicit request for silence, set when they dismiss a suggestion for an item they buy
-	// only occasionally. Stored so a member who was offline when it was set still learns the item is
-	// quiet; without it here, their device would keep predicting for an item the household muted.
+	// QuietUntilFirstPurchase means "make no prediction about this item until its next purchase or
+	// its next Need Now, whichever comes first" — a member's explicit request for silence, set when
+	// they dismiss a suggestion for an item they buy only occasionally. Stored so a member who was
+	// offline when it was set still learns the item is quiet; without it here, their device would
+	// keep predicting for an item the household muted.
+	//
+	// The clear is DERIVED, not sent: no client ever puts `false` on the wire for this key (R-549).
+	// The relay itself clears the persisted column when an op's purchasedAt or lastWantedAt is
+	// strictly newer than the stored fact (db.go's updateItem) — that is what lets an old build,
+	// which will never send the key, still heal on its next purchase or want.
 	//
 	// The name says "first" and the meaning is the NEXT purchase. That is deliberate: the key is the
 	// contract with apps already in the field, so the meaning widened and the key did not. Do not
