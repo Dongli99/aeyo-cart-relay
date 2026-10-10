@@ -867,7 +867,17 @@ func ApplyLWW(
 	`, itemID, cartID).Scan(&existing.ts, &existing.deviceID, &existing.deleted, &existing.deletedAt)
 
 	if err == sql.ErrNoRows {
-		// No existing row → insert.
+		// No existing row: only an add may create one. An update carries only the
+		// fields its act changed, so a row built from it is partial (a notes edit
+		// would become an item with an empty title). The same rule as ADR-039's
+		// "an update must never resurrect", one step earlier: an update must never
+		// create. An update can reach a missing row only through a lost add, and
+		// the client's orphan self-heal repairs that by re-sending the whole add.
+		// Discarding leaves the row absent so that repair can still see it.
+		if op == "update" {
+			log.Printf("ApplyLWW: update skipped on missing item %s/%s — only an add creates", cartID, itemID)
+			return false, nil
+		}
 		return insertItem(db, cartID, itemID, op, fields, effectiveTs, deviceID, userID)
 	}
 	if err != nil {

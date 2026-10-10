@@ -1460,3 +1460,39 @@ func TestGetMembersSurvivesAMissingRoomRow(t *testing.T) {
 		}
 	}
 }
+
+// An update must never CREATE a row (ADR-039's "never resurrect", extended). An
+// update carries only the fields its act changed, so a row built from one is
+// partial: a notes edit would become an item with an empty title. The only way
+// an update reaches a missing row is a lost add, and the client's orphan
+// self-heal repairs that by re-sending the whole add. Inserting here would
+// create a row that blocks that repair.
+func TestApplyLWWUpdateOnMissingRowIsDiscarded(t *testing.T) {
+	db := testDB(t)
+
+	ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		map[string]any{"notes": "oat"}, 1000, "dev-1", "user-a")
+	if err != nil || ok {
+		t.Fatalf("update on missing row: ok=%v err=%v, want ok=false", ok, err)
+	}
+	if _, found := itemDeleted(t, db, "cart-a", "item-1"); found {
+		t.Errorf("update on missing row must leave no row, live or tombstoned")
+	}
+}
+
+// Regression guard for the above: an add on a missing row still inserts.
+func TestApplyLWWAddOnMissingRowInserts(t *testing.T) {
+	db := testDB(t)
+
+	ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+		map[string]any{"title": "Milk", "quantity": float64(2)}, 1000, "dev-1", "user-a")
+	if err != nil || !ok {
+		t.Fatalf("add on missing row: ok=%v err=%v, want ok=true", ok, err)
+	}
+	if title, found := itemTitle(t, db, "cart-a", "item-1"); !found || title != "Milk" {
+		t.Errorf("title: found=%v title=%q, want \"Milk\"", found, title)
+	}
+	if q := itemQuantity(t, db, "cart-a", "item-1"); q != 2 {
+		t.Errorf("quantity: got %d, want 2", q)
+	}
+}
