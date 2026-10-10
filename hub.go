@@ -539,8 +539,8 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 	// Consumption capture (§3.4): an accepted checked op appends/retracts a
 	// consumption_events row, keyed by the reservoir spine COALESCE(global_id, id)
 	// (ADR-052 — concept-less items accrete under their cart-scoped item id).
-	if checkedVal, ok := op.Fields["checked"].(bool); ok {
-		captureConsumption(db, cartID, op.ID, checkedVal)
+	if _, ok := op.Fields["checked"].(bool); ok {
+		captureConsumption(db, cartID, op.ID, op.Fields, msg.Ts)
 	}
 
 	// Inject the actor into the relayed message — the system sentinel for

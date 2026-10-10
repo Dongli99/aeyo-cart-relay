@@ -702,7 +702,13 @@ const (
 // client's COALESCE(concept, item.uuid) spine). The row is looked up from the
 // DB, not the op's fields, because a checked:true update typically carries only
 // {"checked": true} with no globalID present.
-func captureConsumption(db *sql.DB, cartID, itemID string, checked bool) {
+//
+// R-585: an uncheck follows its author's verdict. fields["cancels"] true retracts the act the uncheck
+// NAMES (fields["purchasedAt"], else the row's recorded fact) by identity; false retracts nothing; an
+// absent key (a client that predates the verdict) keeps the undo window, measured against rawTs — the
+// op's own ts, not the LWW value the row stored, which is capped at the relay's clock + 60 s.
+func captureConsumption(db *sql.DB, cartID, itemID string, fields map[string]any, rawTs float64) {
+	checked, _ := fields["checked"].(bool)
 	var globalID sql.NullString
 	var ts float64
 	var purchasedAt sql.NullFloat64
@@ -736,16 +742,37 @@ func captureConsumption(db *sql.DB, cartID, itemID string, checked bool) {
 		return
 	}
 
-	// Uncheck: retract the most recent event only if it falls within the undo
-	// window of this uncheck's ts — an uncheck of a long-ago-checked item must
-	// never delete an older, legitimate consumption.
+	if cancels, ok := fields["cancels"].(bool); ok {
+		if !cancels {
+			return
+		}
+		act := ts
+		if purchasedAt.Valid {
+			act = purchasedAt.Float64
+		}
+		if v, ok := fields["purchasedAt"]; ok {
+			if f, ok := v.(float64); ok {
+				act = f
+			}
+		}
+		if _, err := db.Exec(`
+			DELETE FROM consumption_events WHERE cart_id = ? AND global_id = ? AND ts = ?
+		`, cartID, spine, act); err != nil {
+			log.Printf("captureConsumption: retract: %v", err)
+		}
+		return
+	}
+
+	// No verdict: retract the most recent event only if it falls within the undo window of this
+	// uncheck's ts — an uncheck of a long-ago-checked item must never delete an older, legitimate
+	// consumption.
 	var maxTs sql.NullFloat64
 	if err := db.QueryRow(`
 		SELECT MAX(ts) FROM consumption_events WHERE cart_id = ? AND global_id = ?
 	`, cartID, spine).Scan(&maxTs); err != nil || !maxTs.Valid {
 		return
 	}
-	if diff := ts - maxTs.Float64; diff >= -consumptionRetractWindow && diff <= consumptionRetractWindow {
+	if diff := rawTs - maxTs.Float64; diff >= -consumptionRetractWindow && diff <= consumptionRetractWindow {
 		if _, err := db.Exec(`
 			DELETE FROM consumption_events WHERE cart_id = ? AND global_id = ? AND ts = ?
 		`, cartID, spine, maxTs.Float64); err != nil {
@@ -1176,17 +1203,25 @@ func updateItem(
 		setClauses += ", deferred_guess_authored_at=?"
 		args = append(args, v)
 	}
+	// R-585: on a checked:false op, purchasedAt and purchaseStoreBrand NAME the act being unchecked —
+	// they assert nothing. Storing them would record a cancelled purchase as the item's last one.
+	unchecking := false
+	if v, ok := fields["checked"]; ok {
+		if b, ok := coerceBool("checked", v); ok && !b {
+			unchecking = true
+		}
+	}
 	// ADR-050: persist the purchase fact when the op carries it (a checked-carrying op). Never cleared
 	// by an unchecked op — the field is simply absent there, leaving the last recorded fact intact.
-	if v, ok := fields["purchasedAt"]; ok {
+	if v, ok := fields["purchasedAt"]; ok && !unchecking {
 		setClauses += ", purchased_at=?"
 		args = append(args, v)
 	}
-	// The store half of that same fact. Present-keys-only, and gated by the sender exactly as
-	// purchasedAt is: it rides only a checked-carrying op, so an unchecked op leaves the last recorded
-	// value alone rather than clearing it. The relay stores the string and never interprets it — a
-	// brand is a label a member typed or a catalog supplied, not an identifier this server resolves.
-	if v, ok := fields["purchaseStoreBrand"]; ok {
+	// The store half of that same fact. Present-keys-only, and gated the same way: an unchecked op
+	// leaves the last recorded value alone rather than clearing it. The relay stores the string and
+	// never interprets it — a brand is a label a member typed or a catalog supplied, not an identifier
+	// this server resolves.
+	if v, ok := fields["purchaseStoreBrand"]; ok && !unchecking {
 		setClauses += ", purchase_store_brand=?"
 		args = append(args, v)
 	}
@@ -1231,6 +1266,7 @@ func updateItem(
 	// expression against the OLD row, so the comparison lives in the same UPDATE as the writes above.
 	if !explicitQuiet {
 		purchasedAtVal, hasPurchasedAt := fields["purchasedAt"]
+		hasPurchasedAt = hasPurchasedAt && !unchecking // an uncheck names an act; it is not a purchase
 		lastWantedAtVal, hasLastWantedAt := fields["lastWantedAt"]
 		if hasPurchasedAt || hasLastWantedAt {
 			cond := ""

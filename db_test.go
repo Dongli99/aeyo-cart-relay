@@ -518,7 +518,7 @@ func TestCaptureConsumptionReassertSameFactIsIdempotent(t *testing.T) {
 		pa+3600, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("initial check-off: ok=%v err=%v", ok, err)
 	}
-	captureConsumption(db, "cart-a", "item-1", true)
+	captureConsumption(db, "cart-a", "item-1", map[string]any{"checked": true}, 0)
 
 	// A stale device re-asserts checked:true the NEXT DAY (fresh op ts) but carrying the SAME fact.
 	nextDay := pa + 86_400 + 3600
@@ -527,7 +527,7 @@ func TestCaptureConsumptionReassertSameFactIsIdempotent(t *testing.T) {
 		nextDay, "dev-2", "user-a"); err != nil || !ok {
 		t.Fatalf("stale re-assert: ok=%v err=%v", ok, err)
 	}
-	captureConsumption(db, "cart-a", "item-1", true)
+	captureConsumption(db, "cart-a", "item-1", map[string]any{"checked": true}, 0)
 
 	events, err := GetConsumptionEvents(db, "cart-a", "g1")
 	if err != nil {
@@ -762,7 +762,7 @@ func TestCaptureConsumptionFallsBackToTs(t *testing.T) {
 		ts, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add without purchasedAt: ok=%v err=%v", ok, err)
 	}
-	captureConsumption(db, "cart-a", "item-1", true)
+	captureConsumption(db, "cart-a", "item-1", map[string]any{"checked": true}, 0)
 
 	events, err := GetConsumptionEvents(db, "cart-a", "g1")
 	if err != nil {
@@ -784,7 +784,7 @@ func TestCaptureConsumptionConceptLessKeysOnItemID(t *testing.T) {
 		pa+3600, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("concept-less check-off: ok=%v err=%v", ok, err)
 	}
-	captureConsumption(db, "cart-a", "item-1", true)
+	captureConsumption(db, "cart-a", "item-1", map[string]any{"checked": true}, 0)
 
 	// Nothing under a concept spine…
 	if events, err := GetConsumptionEvents(db, "cart-a", "g1"); err != nil || len(events) != 0 {
@@ -1495,4 +1495,164 @@ func TestApplyLWWAddOnMissingRowInserts(t *testing.T) {
 	if q := itemQuantity(t, db, "cart-a", "item-1"); q != 2 {
 		t.Errorf("quantity: got %d, want 2", q)
 	}
+}
+
+// R-585 A: on a checked:false op, purchasedAt and purchaseStoreBrand NAME the act being unchecked —
+// they assert nothing, so the update path must neither store them nor let them end a silence.
+func TestUncheckNamesActWithoutStoringIt(t *testing.T) {
+	seed := func(t *testing.T) *sql.DB {
+		t.Helper()
+		db := testDB(t)
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+			map[string]any{"title": "Sunscreen", "checked": true, "purchasedAt": 1000.0,
+				"purchaseStoreBrand": "Acme", "quietUntilFirstPurchase": true},
+			1000, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("seed: ok=%v err=%v", ok, err)
+		}
+		return db
+	}
+
+	t.Run("an uncheck stores neither the named act nor its store", func(t *testing.T) {
+		db := seed(t)
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+			map[string]any{"checked": false, "purchasedAt": 2000.0, "purchaseStoreBrand": "Other", "cancels": true},
+			2001, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("uncheck: ok=%v err=%v", ok, err)
+		}
+		var pa float64
+		var brand string
+		if err := db.QueryRow(`SELECT purchased_at, purchase_store_brand FROM items WHERE id='item-1'`).
+			Scan(&pa, &brand); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if pa != 1000.0 || brand != "Acme" {
+			t.Errorf("uncheck overwrote the recorded fact: purchased_at=%v brand=%q, want 1000 / Acme", pa, brand)
+		}
+	})
+
+	t.Run("an uncheck naming a newer act does not end the silence", func(t *testing.T) {
+		db := seed(t)
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+			map[string]any{"checked": false, "purchasedAt": 2000.0}, 2001, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("uncheck: ok=%v err=%v", ok, err)
+		}
+		items, err := GetItems(db, "cart-a")
+		if err != nil || len(items) != 1 {
+			t.Fatalf("GetItems: err=%v n=%d", err, len(items))
+		}
+		if !items[0].QuietUntilFirstPurchase {
+			t.Error("quiet cleared by an uncheck that merely names an act")
+		}
+	})
+
+	t.Run("an uncheck carrying a newer lastWantedAt still clears the silence", func(t *testing.T) {
+		db := seed(t)
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+			map[string]any{"checked": false, "purchasedAt": 2000.0, "lastWantedAt": 3000.0},
+			3001, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("uncheck+want: ok=%v err=%v", ok, err)
+		}
+		items, _ := GetItems(db, "cart-a")
+		if len(items) != 1 || items[0].QuietUntilFirstPurchase {
+			t.Error("a real want must still clear the silence, even on an uncheck")
+		}
+	})
+}
+
+// R-585 A: captureConsumption follows the uncheck author's verdict.
+func TestCaptureConsumptionFollowsCancelsVerdict(t *testing.T) {
+	const act = 1_700_000_000.0
+	seed := func(t *testing.T) *sql.DB {
+		t.Helper()
+		db := testDB(t)
+		fields := map[string]any{"title": "Milk", "checked": true, "globalID": "g1", "purchasedAt": act}
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "add", fields, act+5, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("seed: ok=%v err=%v", ok, err)
+		}
+		captureConsumption(db, "cart-a", "item-1", fields, act+5)
+		// An older, legitimate act the verdict must never touch.
+		if _, err := db.Exec(`INSERT INTO consumption_events (cart_id, global_id, ts) VALUES ('cart-a','g1',?)`,
+			act-86_400); err != nil {
+			t.Fatalf("older event: %v", err)
+		}
+		return db
+	}
+	uncheck := func(t *testing.T, db *sql.DB, fields map[string]any, rawTs float64) {
+		t.Helper()
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update", fields, rawTs, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("uncheck: ok=%v err=%v", ok, err)
+		}
+		captureConsumption(db, "cart-a", "item-1", fields, rawTs)
+	}
+	events := func(t *testing.T, db *sql.DB) []float64 {
+		t.Helper()
+		ev, err := GetConsumptionEvents(db, "cart-a", "g1")
+		if err != nil {
+			t.Fatalf("GetConsumptionEvents: %v", err)
+		}
+		return ev
+	}
+
+	t.Run("cancels:true retracts the named act by identity, beyond the window", func(t *testing.T) {
+		db := seed(t)
+		// Hours later — far outside the 30 s window — naming the act explicitly.
+		uncheck(t, db, map[string]any{"checked": false, "purchasedAt": act, "cancels": true}, act+7200)
+		ev := events(t, db)
+		if len(ev) != 1 || ev[0] != act-86_400 {
+			t.Fatalf("events=%v, want only the older act", ev)
+		}
+	})
+
+	t.Run("cancels:true without purchasedAt falls back to the stored act", func(t *testing.T) {
+		db := seed(t)
+		uncheck(t, db, map[string]any{"checked": false, "cancels": true}, act+7200)
+		if ev := events(t, db); len(ev) != 1 || ev[0] != act-86_400 {
+			t.Fatalf("events=%v, want only the older act", ev)
+		}
+	})
+
+	t.Run("cancels:true naming an act with no row does nothing", func(t *testing.T) {
+		db := seed(t)
+		uncheck(t, db, map[string]any{"checked": false, "purchasedAt": act + 999, "cancels": true}, act+7)
+		if ev := events(t, db); len(ev) != 2 {
+			t.Fatalf("events=%v, want both rows kept", ev)
+		}
+	})
+
+	t.Run("cancels:false retracts nothing, even inside the window", func(t *testing.T) {
+		db := seed(t)
+		uncheck(t, db, map[string]any{"checked": false, "purchasedAt": act, "cancels": false}, act+6)
+		if ev := events(t, db); len(ev) != 2 {
+			t.Fatalf("events=%v, want both rows kept", ev)
+		}
+	})
+
+	t.Run("no cancels key keeps today's window", func(t *testing.T) {
+		db := seed(t)
+		uncheck(t, db, map[string]any{"checked": false}, act+10)
+		if ev := events(t, db); len(ev) != 1 || ev[0] != act-86_400 {
+			t.Fatalf("inside window: events=%v, want only the older act", ev)
+		}
+		db = seed(t)
+		uncheck(t, db, map[string]any{"checked": false}, act+3600)
+		if ev := events(t, db); len(ev) != 2 {
+			t.Fatalf("outside window: events=%v, want both rows kept", ev)
+		}
+	})
+
+	t.Run("the window compares the raw op ts, not the clamped stored one", func(t *testing.T) {
+		db := testDB(t)
+		now := float64(time.Now().Unix())
+		fact := now + 600 // a skewed client: its clock runs ~10 min ahead of the relay
+		fields := map[string]any{"title": "Milk", "checked": true, "globalID": "g1", "purchasedAt": fact}
+		if ok, err := ApplyLWW(db, "cart-a", "item-1", "add", fields, now, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("seed: ok=%v err=%v", ok, err)
+		}
+		captureConsumption(db, "cart-a", "item-1", fields, now)
+		// Raw ts is 5 s after the fact; LWW stores it clamped to now+60, ~9 min before the fact.
+		uncheck(t, db, map[string]any{"checked": false}, fact+5)
+		if ev, _ := GetConsumptionEvents(db, "cart-a", "g1"); len(ev) != 0 {
+			t.Fatalf("events=%v, want the act retracted (raw ts is 5 s after it)", ev)
+		}
+	})
 }

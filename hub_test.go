@@ -482,3 +482,63 @@ func keysOf(m map[string]string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// R-585 A: purchaseUTCOffset and cancels ride inside fields, reach peers byte-for-byte, and leave no trace
+// in the database — the relay never stores them, so a STATE snapshot cannot carry them.
+func TestDeltaPassesThroughUncheckKeysWithoutStoringThem(t *testing.T) {
+	db := testDB(t)
+	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+	hub := NewHub()
+	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-a", "dev-2"), "cart-a")
+
+	send := func(ts float64, op Op) {
+		raw, _ := json.Marshal(DeltaMsg{Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: ts, Ops: []Op{op}})
+		handleDelta(sender, hub, db, raw)
+	}
+	send(1000, Op{Op: "add", ID: "item-1", Fields: map[string]any{
+		"title": "Milk", "checked": true, "purchasedAt": 1000.0, "purchaseUTCOffset": -18000.0}})
+	<-peer.send // the add's relay
+	send(1010, Op{Op: "update", ID: "item-1", Fields: map[string]any{
+		"checked": false, "purchasedAt": 1000.0, "cancels": true, "purchaseUTCOffset": -18000.0}})
+
+	var relayed DeltaMsg
+	select {
+	case b := <-peer.send:
+		if err := json.Unmarshal(b, &relayed); err != nil {
+			t.Fatalf("peer relay decode: %v", err)
+		}
+	default:
+		t.Fatal("peer received no relay for the uncheck")
+	}
+	f := relayed.Ops[0].Fields
+	if f["cancels"] != true || f["purchaseUTCOffset"] != -18000.0 || f["purchasedAt"] != 1000.0 {
+		t.Errorf("relayed fields = %v, want cancels/purchaseUTCOffset/purchasedAt intact", f)
+	}
+
+	// No new state: neither key names a column, and the STATE snapshot's bytes mention neither.
+	rows, err := db.Query(`SELECT name FROM pragma_table_info('items')`)
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		_ = rows.Scan(&name)
+		if l := strings.ToLower(name); strings.Contains(l, "cancel") || strings.Contains(l, "utcoffset") || strings.Contains(l, "utc_offset") {
+			t.Errorf("items column %q stores a pass-through key", name)
+		}
+	}
+	state, _ := json.Marshal(buildStateMsg(db, hub, "cart-a"))
+	// Positive control: an empty snapshot would pass the absence check below vacuously.
+	if !bytes.Contains(state, []byte("Milk")) {
+		t.Fatalf("STATE snapshot does not carry the item, so its absence check proves nothing: %s", state)
+	}
+	for _, key := range []string{"cancels", "purchaseUTCOffset"} {
+		if bytes.Contains(state, []byte(key)) {
+			t.Errorf("STATE snapshot carries %q: %s", key, state)
+		}
+	}
+}
