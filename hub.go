@@ -526,32 +526,30 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 		actor = systemActor
 	}
 
-	accepted, err := ApplyLWW(db, cartID, op.ID, op.Op, op.Fields, msg.Ts, msg.DeviceID, actor)
+	out, err := ApplyOp(db, cartID, op.ID, op.Op, op.Fields, msg.Ts, msg.DeviceID, actor)
 	if err != nil {
-		log.Printf("handleDelta: ApplyLWW error: %v", err)
+		log.Printf("handleDelta: ApplyOp error: %v", err)
 		return
 	}
-	if !accepted {
+	if !out.Applied {
 		sendAck(c, msg.CartID, op.ID, msg.Ts, "discarded")
 		return
 	}
 
-	// Consumption capture (§3.4): an accepted checked op appends/retracts a
-	// consumption_events row, keyed by the reservoir spine COALESCE(global_id, id)
-	// (ADR-052 — concept-less items accrete under their cart-scoped item id).
-	if _, ok := op.Fields["checked"].(bool); ok {
-		captureConsumption(db, cartID, op.ID, op.Fields, msg.Ts)
+	// Peers hear only what took effect (R-585): a refused re-assert would replay an old purchase on
+	// their phones, and stale content riding a late act would revert a newer edit. The relayed ts stays
+	// the op's own. The actor injected is the system sentinel for system-attributed writes, else the
+	// connection's authenticated userID.
+	if out.Broadcast {
+		msg.Ops[0].Fields = out.Fields
+		msg.UserID = actor
+		msg.CartID = cartID
+		relayed, err := json.Marshal(msg)
+		if err != nil {
+			return
+		}
+		h.BroadcastToCart(cartID, relayed, c.deviceID)
 	}
-
-	// Inject the actor into the relayed message — the system sentinel for
-	// system-attributed writes, else the connection's authenticated userID.
-	msg.UserID = actor
-	msg.CartID = cartID
-	relayed, err := json.Marshal(msg)
-	if err != nil {
-		return
-	}
-	h.BroadcastToCart(cartID, relayed, c.deviceID)
 
 	sendAck(c, cartID, op.ID, msg.Ts, "applied")
 }

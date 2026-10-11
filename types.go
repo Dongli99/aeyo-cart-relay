@@ -117,10 +117,11 @@ type ItemRow struct {
 	// Same presence semantics as DeferredGuessDate: field-merged, and pairs the anchor's NSNull on a
 	// clear. Absent-tolerant — an old client omits it and the receiver falls back to value comparison.
 	DeferredGuessAuthoredAt *float64 `json:"deferredGuessAuthoredAt"`
-	// PurchasedAt is the purchase FACT time carried on a checked-carrying op/row (ADR-050) —
-	// distinct from Ts (the LWW ordering time). omitempty so a concept-less/unchecked/old row
-	// omits it and the receiver falls back to Ts. State rows carry it so a reconnect snapshot,
-	// not only a live delta, delivers the fact (closing the state-door hole).
+	// PurchasedAt is the instant of the latest purchase act the row holds (ADR-050, R-585) —
+	// distinct from Ts (the LWW ordering time). The row is checked, or unchecked when an uncheck
+	// took that act back. omitempty: a row that never held an act omits it, and an absent key
+	// means no act — a receiver never makes one up from Ts. State rows carry it so a reconnect
+	// snapshot, not only a live delta, delivers the fact (closing the state-door hole).
 	PurchasedAt *float64 `json:"purchasedAt,omitempty"`
 	// PurchaseStoreBrand is the BRAND NAME of the shop that purchase happened at, riding the same
 	// checked-carrying ops and rows as PurchasedAt. A store RECORD never crosses this relay — stores
@@ -130,6 +131,12 @@ type ItemRow struct {
 	// purchase with no store, and every row written before this column existed all omit the key, and an
 	// absent key means "that purchase's store is unknown" — never "reuse the last one".
 	PurchaseStoreBrand *string `json:"purchaseStoreBrand,omitempty"`
+	// Cancels is true when the author of an uncheck said it takes back the act PurchasedAt names (R-585),
+	// so a member who was offline for the uncheck still cancels that purchase on reconnect, and does not
+	// keep one the household dropped. It is the author's verdict, stored as one bit and never recomputed.
+	// omitempty, and only ever true: a row lowered without a verdict, a "keep" verdict, and every row
+	// written before the column existed all omit the key — and an absent key never means "cancelled".
+	Cancels bool `json:"cancels,omitempty"`
 	// Label hints (ADR-051): the sender's own category/store labels, carried so a receiver can
 	// fill its OWN blank fields once, as a backstop to receiver-side resolution — not synced state
 	// (category/store stay personal). Additive & absent-tolerant like PurchasedAt: old rows yield
@@ -156,9 +163,10 @@ type ItemRow struct {
 	// keep predicting for an item the household muted.
 	//
 	// The clear is DERIVED, not sent: no client ever puts `false` on the wire for this key (R-549).
-	// The relay itself clears the persisted column when an op's purchasedAt or lastWantedAt is
-	// strictly newer than the stored fact (db.go's updateItem) — that is what lets an old build,
-	// which will never send the key, still heal on its next purchase or want.
+	// The relay itself clears the persisted column when a check-off advances the item's act
+	// (decideCompletion in db.go) or an op's lastWantedAt is strictly newer than the stored one
+	// (updateItem) — that is what lets an old build, which will never send the key, still heal on its
+	// next purchase or want.
 	//
 	// The name says "first" and the meaning is the NEXT purchase. That is deliberate: the key is the
 	// contract with apps already in the field, so the meaning widened and the key did not. Do not

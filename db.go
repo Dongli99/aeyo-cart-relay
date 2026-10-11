@@ -39,6 +39,7 @@ const itemsTableBody = `
     deferred_guess_authored_at REAL,
     purchased_at  REAL,
     purchase_store_brand TEXT,
+    purchase_cancelled  INTEGER DEFAULT 0,
     category_hint_name  TEXT,
     category_hint_icon  TEXT,
     category_hint_color TEXT,
@@ -137,6 +138,11 @@ var itemFactColumns = []struct{ name, ddl string }{
 	// purchased_at: the app settles a purchase into history up to a day after the tap, and by then the
 	// op is long gone.
 	{"purchase_store_brand", "ALTER TABLE items ADD COLUMN purchase_store_brand TEXT"},
+	// R-585: true only when an author's cancels:true verdict lowered or advanced the row's act, so a
+	// reconnecting phone reads the cancel off the state row instead of keeping a purchase its author took
+	// back. A bit, never the verdict itself: cancels:false is not stored, and neither is the offset. It
+	// cannot be derived from the reservoir lacking the act — legacy rows lack acts nobody cancelled.
+	{"purchase_cancelled", "ALTER TABLE items ADD COLUMN purchase_cancelled INTEGER DEFAULT 0"},
 	// ADR-051 label hints — the sender's category/store labels, a receiver-side hydration backstop.
 	{"category_hint_name", "ALTER TABLE items ADD COLUMN category_hint_name TEXT"},
 	{"category_hint_icon", "ALTER TABLE items ADD COLUMN category_hint_icon TEXT"},
@@ -237,7 +243,7 @@ func migrateItemsCompositeKey(db *sql.DB) error {
 	const cols = `id, cart_id, title, quantity, checked, notes, specification,
 		urgency_level, global_id, frequency_days, is_active, paused_at,
 		pause_reason, deferred_guess_date, deferred_guess_authored_at, purchased_at,
-		purchase_store_brand,
+		purchase_store_brand, purchase_cancelled,
 		category_hint_name, category_hint_icon, category_hint_color, store_hint_brand,
 		last_wanted_at, quiet_until_first_purchase,
 		attributed_to, ts, device_id, deleted, deleted_at`
@@ -555,7 +561,7 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 		       notes, specification, COALESCE(urgency_level,1),
 		       global_id, frequency_days, COALESCE(is_active,1),
 		       paused_at, pause_reason, deferred_guess_date, deferred_guess_authored_at, purchased_at,
-		       purchase_store_brand,
+		       purchase_store_brand, COALESCE(purchase_cancelled,0),
 		       category_hint_name, category_hint_icon, category_hint_color, store_hint_brand,
 		       last_wanted_at, COALESCE(quiet_until_first_purchase,0)
 		FROM items
@@ -592,7 +598,7 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 			&notes, &specification, &item.UrgencyLevel,
 			&globalID, &frequencyDays, &item.IsActive,
 			&pausedAt, &pauseReason, &deferredGuessDate, &deferredGuessAuthoredAt, &purchasedAt,
-			&purchaseStoreBrand,
+			&purchaseStoreBrand, &item.Cancels,
 			&categoryHintName, &categoryHintIcon, &categoryHintColor, &storeHintBrand,
 			&lastWantedAt, &item.QuietUntilFirstPurchase,
 		); err != nil {
@@ -695,27 +701,40 @@ const (
 	consumptionRetractWindow = 30.0 // seconds
 )
 
-// captureConsumption appends or retracts a consumption_events row for an
-// accepted checked op. Keyed on the reservoir SPINE = COALESCE(global_id, id):
-// the concept global_id when the item has one, else the cart-scoped item id
-// (ADR-052 — concept-less items keep accreting for late joiners, matching the
-// client's COALESCE(concept, item.uuid) spine). The row is looked up from the
-// DB, not the op's fields, because a checked:true update typically carries only
-// {"checked": true} with no globalID present.
-//
-// R-585: an uncheck follows its author's verdict. fields["cancels"] true retracts the act the uncheck
-// NAMES (fields["purchasedAt"], else the row's recorded fact) by identity; false retracts nothing; an
-// absent key (a client that predates the verdict) keeps the undo window, measured against rawTs — the
-// op's own ts, not the LWW value the row stored, which is capped at the relay's clock + 60 s.
-func captureConsumption(db *sql.DB, cartID, itemID string, fields map[string]any, rawTs float64) {
-	checked, _ := fields["checked"].(bool)
+// reservoirMove is what one op does to the consumption reservoir, decided by decideCompletion. The
+// reservoir moves with the act, never with the row: it records an act only when a check-off advances
+// the item, and retracts one by identity on its author's cancel.
+type reservoirMove struct {
+	kind reservoirMoveKind
+	at   float64 // the act recorded or retracted; for retractRecent, the uncheck's own raw ts
+}
+
+type reservoirMoveKind int
+
+const (
+	reservoirNone reservoirMoveKind = iota
+	reservoirRecord
+	reservoirRetract
+	// reservoirRetractRecent is an uncheck that carries no verdict (a client that predates it): it
+	// retracts the most recent event only if it falls within consumptionRetractWindow of the uncheck's
+	// raw ts — not the LWW value the row stored, which is capped at the relay's clock + 60 s — so an
+	// uncheck of a long-ago check-off never deletes an older, legitimate consumption.
+	reservoirRetractRecent
+)
+
+// captureConsumption applies a reservoirMove, keyed on the reservoir SPINE = COALESCE(global_id, id):
+// the concept global_id when the item has one, else the cart-scoped item id (ADR-052 — concept-less
+// items keep accreting for late joiners, matching the client's COALESCE(concept, item.uuid) spine). The
+// spine is read from the row, because a completion op typically carries no globalID. The act is never
+// read from the row: the owner hands it over, so there is no instant here to make one up from.
+func captureConsumption(q querier, cartID, itemID string, m reservoirMove) {
+	if m.kind == reservoirNone {
+		return
+	}
 	var globalID sql.NullString
-	var ts float64
-	var purchasedAt sql.NullFloat64
-	err := db.QueryRow(`
-		SELECT global_id, ts, purchased_at FROM items WHERE id = ? AND cart_id = ?
-	`, itemID, cartID).Scan(&globalID, &ts, &purchasedAt)
-	if err != nil {
+	if err := q.QueryRow(`
+		SELECT global_id FROM items WHERE id = ? AND cart_id = ?
+	`, itemID, cartID).Scan(&globalID); err != nil {
 		return
 	}
 	spine := itemID
@@ -723,68 +742,42 @@ func captureConsumption(db *sql.DB, cartID, itemID string, fields map[string]any
 		spine = globalID.String
 	}
 
-	if checked {
-		// ADR-050: stamp the reservoir with the purchase FACT time, falling back to the LWW ts for an
-		// old client that didn't carry it. A re-assert of the same completion carries the same fact →
-		// same (cart_id, global_id, ts) PK → INSERT OR IGNORE collapses it (idempotent by construction,
-		// no cross-day phantom).
-		eventTs := ts
-		if purchasedAt.Valid {
-			eventTs = purchasedAt.Float64
-		}
-		if _, err := db.Exec(`
+	act := m.at
+	switch m.kind {
+	case reservoirRecord:
+		// A re-assert of the same act keys the same (cart_id, global_id, ts) row, so INSERT OR IGNORE
+		// collapses it (idempotent by construction, no cross-day phantom).
+		if _, err := q.Exec(`
 			INSERT OR IGNORE INTO consumption_events (cart_id, global_id, ts) VALUES (?, ?, ?)
-		`, cartID, spine, eventTs); err != nil {
+		`, cartID, spine, act); err != nil {
 			log.Printf("captureConsumption: insert: %v", err)
 			return
 		}
-		pruneConsumptionEvents(db, cartID, spine)
+		pruneConsumptionEvents(q, cartID, spine)
 		return
-	}
-
-	if cancels, ok := fields["cancels"].(bool); ok {
-		if !cancels {
+	case reservoirRetractRecent:
+		var maxTs sql.NullFloat64
+		if err := q.QueryRow(`
+			SELECT MAX(ts) FROM consumption_events WHERE cart_id = ? AND global_id = ?
+		`, cartID, spine).Scan(&maxTs); err != nil || !maxTs.Valid {
 			return
 		}
-		act := ts
-		if purchasedAt.Valid {
-			act = purchasedAt.Float64
+		if diff := m.at - maxTs.Float64; diff < -consumptionRetractWindow || diff > consumptionRetractWindow {
+			return
 		}
-		if v, ok := fields["purchasedAt"]; ok {
-			if f, ok := v.(float64); ok {
-				act = f
-			}
-		}
-		if _, err := db.Exec(`
-			DELETE FROM consumption_events WHERE cart_id = ? AND global_id = ? AND ts = ?
-		`, cartID, spine, act); err != nil {
-			log.Printf("captureConsumption: retract: %v", err)
-		}
-		return
+		act = maxTs.Float64
 	}
-
-	// No verdict: retract the most recent event only if it falls within the undo window of this
-	// uncheck's ts — an uncheck of a long-ago-checked item must never delete an older, legitimate
-	// consumption.
-	var maxTs sql.NullFloat64
-	if err := db.QueryRow(`
-		SELECT MAX(ts) FROM consumption_events WHERE cart_id = ? AND global_id = ?
-	`, cartID, spine).Scan(&maxTs); err != nil || !maxTs.Valid {
-		return
-	}
-	if diff := rawTs - maxTs.Float64; diff >= -consumptionRetractWindow && diff <= consumptionRetractWindow {
-		if _, err := db.Exec(`
-			DELETE FROM consumption_events WHERE cart_id = ? AND global_id = ? AND ts = ?
-		`, cartID, spine, maxTs.Float64); err != nil {
-			log.Printf("captureConsumption: retract: %v", err)
-		}
+	if _, err := q.Exec(`
+		DELETE FROM consumption_events WHERE cart_id = ? AND global_id = ? AND ts = ?
+	`, cartID, spine, act); err != nil {
+		log.Printf("captureConsumption: retract: %v", err)
 	}
 }
 
 // pruneConsumptionEvents caps a (cart_id, global_id) reservoir to the most
 // recent reservoirCap rows.
-func pruneConsumptionEvents(db *sql.DB, cartID, globalID string) {
-	_, err := db.Exec(`
+func pruneConsumptionEvents(q querier, cartID, globalID string) {
+	_, err := q.Exec(`
 		DELETE FROM consumption_events
 		WHERE cart_id = ? AND global_id = ? AND ts NOT IN (
 			SELECT ts FROM consumption_events
@@ -837,16 +830,215 @@ func BackfillConsumptionEvents(db *sql.DB, cartID, globalID string, events []flo
 // LWW
 // ---------------------------------------------------------------------------
 
-// ApplyLWW applies a single operation using last-write-wins conflict resolution.
-// Returns accepted=true if the write was applied to the DB.
-// Algorithm matches TDD §4.5 exactly.
-func ApplyLWW(
+// querier is what *sql.DB and *sql.Tx both offer, so one op's reads and writes can share the
+// transaction that makes them a single step.
+type querier interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// completionKeys are the wire keys of an op's completion part (R-585). Every other key is content.
+// purchaseUTCOffset passes through to peers beside an act and is never stored.
+var completionKeys = map[string]bool{
+	"checked": true, "purchasedAt": true, "purchaseStoreBrand": true, "cancels": true, "purchaseUTCOffset": true,
+}
+
+// actSkew bounds how far past the relay's clock an act instant may sit and still be an act: the same
+// 60 s the LWW clamp allows a ts. A later purchasedAt is no act at all — admitted, it would sit above
+// every real act of the following hours and refuse each of them.
+const actSkew = 60.0
+
+// OpOutcome is what one op did.
+type OpOutcome struct {
+	Applied   bool           // some part of the op took effect: the sender's ack reads "applied", else "discarded"
+	Broadcast bool           // peers must hear of it
+	Fields    map[string]any // the op's keys that took effect — exactly what a broadcast relays
+}
+
+// ApplyOp applies one op in one transaction. The op splits by its keys (R-585): the CONTENT part follows
+// last-write-wins (ApplyLWW), and the COMPLETION part applies by act identity whatever LWW said
+// (decideCompletion). A completion that loses LWW is still an act — an uncheck made offline before
+// somebody renamed the item is still that member's uncheck — but its stale content must not ride in on
+// it. The guards bind the whole op: an update to a missing or tombstoned row, and an add older than its
+// tombstone, apply neither part.
+func ApplyOp(
 	db *sql.DB,
 	cartID, itemID, op string,
 	fields map[string]any,
 	ts float64,
 	deviceID, userID string,
-) (bool, error) {
+) (OpOutcome, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return OpOutcome{}, err
+	}
+	defer tx.Rollback()
+
+	lww, err := ApplyLWW(tx, cartID, itemID, op, fields, ts, deviceID)
+	if err != nil || lww == lwwRefused {
+		return OpOutcome{}, err
+	}
+	if op == "delete" {
+		return OpOutcome{Applied: true, Broadcast: true, Fields: fields}, tx.Commit()
+	}
+
+	won := lww == lwwWon
+	var row completionPair
+	var deleted bool
+	if err := tx.QueryRow(`
+		SELECT checked, purchased_at, attributed_to, purchase_store_brand, COALESCE(purchase_cancelled,0), deleted
+		FROM items WHERE id=? AND cart_id=?
+	`, itemID, cartID).Scan(&row.checked, &row.purchasedAt, &row.completer, &row.brand, &row.cancelled, &deleted); err != nil {
+		return OpOutcome{}, err
+	}
+	var v completionVerdict
+	if !deleted { // an add that lost LWW to a stale tombstone left the row deleted: no act lands on it
+		v = decideCompletion(op, fields, won, row, float64(time.Now().Unix()), ts, userID)
+	}
+	if v.next != row || v.clearQuiet {
+		if _, err := tx.Exec(`
+			UPDATE items SET checked=?, purchased_at=?, attributed_to=?, purchase_store_brand=?, purchase_cancelled=?,
+			    quiet_until_first_purchase = CASE WHEN ? THEN 0 ELSE quiet_until_first_purchase END
+			WHERE id=? AND cart_id=?
+		`, boolToInt(v.next.checked), v.next.purchasedAt, v.next.completer, v.next.brand, boolToInt(v.next.cancelled),
+			v.clearQuiet, itemID, cartID); err != nil {
+			return OpOutcome{}, err
+		}
+	}
+	captureConsumption(tx, cartID, itemID, v.capture)
+
+	out := OpOutcome{Applied: won || v.tookEffect}
+	for k, val := range fields {
+		if completionKeys[k] && v.tookEffect || !completionKeys[k] && won {
+			if out.Fields == nil {
+				out.Fields = map[string]any{}
+			}
+			out.Fields[k] = val
+		}
+	}
+	out.Broadcast = len(out.Fields) > 0
+	return out, tx.Commit()
+}
+
+// completionPair is an item row's completion state. (checked, purchasedAt) is a monotone register on the
+// act instant; completer and brand describe the act it holds, and cancelled is its author's stored
+// verdict that the act was taken back.
+type completionPair struct {
+	checked     bool
+	purchasedAt sql.NullFloat64
+	completer   sql.NullString
+	brand       sql.NullString
+	cancelled   bool
+}
+
+// completionVerdict is decideCompletion's ruling on one op.
+type completionVerdict struct {
+	next       completionPair // the row's completion state after the op
+	capture    reservoirMove
+	clearQuiet bool // the derived end of a "quiet until the next purchase" (R-549): a check-off advanced the act
+	tookEffect bool // the op's completion keys go to peers
+}
+
+// decideCompletion is the one owner of an op's completion part (R-585): the row's new pair, its cancel
+// bit, the reservoir move, and whether peers hear of it. Op shapes are read by their KEYS, never by
+// which build sent them — the relay cannot tell an old client's snapshot from a new client's op, so a
+// shape decides. `row` is the item's completion state before the op; `won` is LWW's verdict on its
+// content; `rawTs` is the op's own ts, unclamped.
+//
+//   - A check-off with a valid act t advances the pair only to a later act (row P null, or t > P), and
+//     records t. Anything else is refused whole: a re-assert of the act already held, or an older one.
+//   - An uncheck's author verdict is followed, never recomputed. cancels:true retracts t by identity
+//     whatever the pair did, lowers the pair only if t is the act it holds, and advances it if t is
+//     later (the uncheck reached the relay before its own check-off). cancels:false keeps everything.
+//   - An uncheck with no verdict (a client that predates it) stays under LWW: it lowers the pair only
+//     when it won, the row is checked, and it names the row's act or nothing.
+//   - An add's checked:false asserts nothing: an add is a birth snapshot, not an act.
+//
+// A valid act is a numeric purchasedAt no later than now + actSkew. No act ever comes from ts.
+func decideCompletion(
+	op string,
+	fields map[string]any,
+	won bool,
+	row completionPair,
+	now, rawTs float64,
+	userID string,
+) completionVerdict {
+	v := completionVerdict{next: row}
+	checked, ok := fields["checked"].(bool)
+	if !ok {
+		return v // a purchasedAt or a brand without checked asserts nothing
+	}
+	t, named := fields["purchasedAt"].(float64)
+	isAct := named && t <= now+actSkew
+	p := row.purchasedAt
+
+	if checked {
+		if !isAct || p.Valid && t <= p.Float64 {
+			return v
+		}
+		brand, hasBrand := fields["purchaseStoreBrand"].(string)
+		v.next = completionPair{
+			checked:     true,
+			purchasedAt: sql.NullFloat64{Float64: t, Valid: true},
+			completer:   sql.NullString{String: userID, Valid: true},
+			brand:       sql.NullString{String: brand, Valid: hasBrand}, // a new act never inherits the last one's shop
+		}
+		v.capture = reservoirMove{reservoirRecord, t}
+		// An explicit flag in this op wins over the derived clear, but only if it applied: a losing op's
+		// flag is stale content, and its act still ends the silence.
+		_, explicitQuiet := fields["quietUntilFirstPurchase"]
+		v.clearQuiet = !(won && explicitQuiet)
+		v.tookEffect = true
+		return v
+	}
+	if op == "add" {
+		return v
+	}
+
+	cancels, hasVerdict := fields["cancels"].(bool)
+	switch {
+	case hasVerdict && !cancels:
+		return v // the act stands as history
+	case hasVerdict && isAct:
+		v.capture = reservoirMove{reservoirRetract, t}
+		v.tookEffect = true
+		switch {
+		case p.Valid && t == p.Float64:
+			v.next = completionPair{purchasedAt: p, brand: row.brand, cancelled: true}
+		case !p.Valid || t > p.Float64:
+			v.next = completionPair{purchasedAt: sql.NullFloat64{Float64: t, Valid: true}, cancelled: true}
+		}
+		return v
+	}
+	// No verdict: bare, naming an act without one, or cancels with no act to name.
+	namesRowAct := !named || p.Valid && t == p.Float64
+	if !won || !row.checked || !namesRowAct {
+		return v
+	}
+	v.next = completionPair{purchasedAt: p, brand: row.brand}
+	v.capture = reservoirMove{reservoirRetractRecent, rawTs}
+	v.tookEffect = true
+	return v
+}
+
+// lwwOutcome is LWW's verdict on an op's content part.
+type lwwOutcome int
+
+const (
+	lwwRefused lwwOutcome = iota // a guard refused the whole op: an update to a missing or tombstoned row, an add older than its tombstone
+	lwwLost                      // the row's content is newer: nothing of the content part applied
+	lwwWon                       // the content part applied, and ts and device_id moved
+)
+
+// ApplyLWW applies an op's CONTENT part using last-write-wins conflict resolution (TDD §4.5), and the
+// guards that bind the whole op. It never writes a completion column: those are decideCompletion's.
+func ApplyLWW(
+	q querier,
+	cartID, itemID, op string,
+	fields map[string]any,
+	ts float64,
+	deviceID string,
+) (lwwOutcome, error) {
 	// Clamp ts: prevent far-future clients from permanently winning all conflicts.
 	effectiveTs := ts
 	if maxTs := float64(time.Now().Unix()) + 60; ts > maxTs {
@@ -856,24 +1048,24 @@ func ApplyLWW(
 	if op == "delete" {
 		// Soft-delete: mark deleted + deleted_at. If row doesn't exist, insert a
 		// tombstone so stale add ops can't resurrect the item.
-		res, err := db.Exec(`
+		res, err := q.Exec(`
 			UPDATE items SET deleted=1, deleted_at=? WHERE id=? AND cart_id=?
 		`, effectiveTs, itemID, cartID)
 		if err != nil {
-			return false, err
+			return lwwRefused, err
 		}
 		n, _ := res.RowsAffected()
 		if n == 0 {
 			// No existing row — insert tombstone.
-			_, err = db.Exec(`
+			_, err = q.Exec(`
 				INSERT INTO items (id, cart_id, ts, device_id, deleted, deleted_at)
 				VALUES (?, ?, ?, ?, 1, ?)
 			`, itemID, cartID, effectiveTs, deviceID, effectiveTs)
 			if err != nil {
-				return false, err
+				return lwwRefused, err
 			}
 		}
-		return true, nil
+		return lwwWon, nil
 	}
 
 	// op == "add" or "update"
@@ -888,7 +1080,7 @@ func ApplyLWW(
 	// the same uuid living in ANOTHER room and LWW-updated that room's row
 	// instead of inserting into this one (the 2026-07-10 re-share incident).
 	var existing existingRow
-	err := db.QueryRow(`
+	err := q.QueryRow(`
 		SELECT ts, COALESCE(device_id,''), deleted, deleted_at
 		FROM items WHERE id=? AND cart_id=?
 	`, itemID, cartID).Scan(&existing.ts, &existing.deviceID, &existing.deleted, &existing.deletedAt)
@@ -903,17 +1095,20 @@ func ApplyLWW(
 		// Discarding leaves the row absent so that repair can still see it.
 		if op == "update" {
 			log.Printf("ApplyLWW: update skipped on missing item %s/%s — only an add creates", cartID, itemID)
-			return false, nil
+			return lwwRefused, nil
 		}
-		return insertItem(db, cartID, itemID, op, fields, effectiveTs, deviceID, userID)
+		if err := insertItem(q, cartID, itemID, fields, effectiveTs, deviceID); err != nil {
+			return lwwRefused, err
+		}
+		return lwwWon, nil
 	}
 	if err != nil {
-		return false, err
+		return lwwRefused, err
 	}
 
 	// Tombstone exists — check if deletion wins.
 	if existing.deleted == 1 && existing.deletedAt.Valid && existing.deletedAt.Float64 > effectiveTs {
-		return false, nil // deletion wins; discard this write
+		return lwwRefused, nil // deletion wins; discard this write
 	}
 
 	// An update must never resurrect a tombstoned row (ADR-039): partial-field
@@ -923,34 +1118,32 @@ func ApplyLWW(
 	// below, since the row already exists here). Skip and log.
 	if existing.deleted == 1 && op == "update" {
 		log.Printf("ApplyLWW: update skipped on tombstoned item %s/%s — no resurrect", cartID, itemID)
-		return false, nil
+		return lwwRefused, nil
 	}
 
 	// Live row or stale tombstone being re-added — check LWW.
-	if effectiveTs > existing.ts {
-		return updateItem(db, cartID, itemID, op, fields, effectiveTs, deviceID, userID)
+	if effectiveTs > existing.ts || effectiveTs == existing.ts && deviceID < existing.deviceID {
+		if err := updateItem(q, cartID, itemID, op, fields, effectiveTs, deviceID); err != nil {
+			return lwwRefused, err
+		}
+		return lwwWon, nil
 	}
-	if effectiveTs == existing.ts && deviceID < existing.deviceID {
-		return updateItem(db, cartID, itemID, op, fields, effectiveTs, deviceID, userID)
-	}
-	return false, nil // discarded
+	return lwwLost, nil
 }
 
+// insertItem creates a row from an add's content part. Its completion columns start empty — an
+// unchecked item nobody has bought — and decideCompletion applies the add's act, if it carries one.
 func insertItem(
-	db *sql.DB,
-	cartID, itemID, op string,
+	q querier,
+	cartID, itemID string,
 	fields map[string]any,
 	ts float64,
-	deviceID, userID string,
-) (bool, error) {
+	deviceID string,
+) error {
 	title, _ := fields["title"].(string)
 	quantity := 1
 	if q, ok := fields["quantity"].(float64); ok {
 		quantity = int(q)
-	}
-	checked := false
-	if c, ok := fields["checked"].(bool); ok {
-		checked = c
 	}
 	var notes any
 	if v, ok := fields["notes"]; ok && v != nil {
@@ -997,16 +1190,6 @@ func insertItem(
 	if v, ok := fields["deferredGuessAuthoredAt"]; ok {
 		deferredGuessAuthoredAt = v
 	}
-	// ADR-050: the purchase fact time rides a checked-carrying op; persisted so state rows carry it
-	// and captureConsumption can stamp the reservoir with the fact, not the LWW ts.
-	var purchasedAt any
-	if v, ok := fields["purchasedAt"]; ok {
-		purchasedAt = v
-	}
-	var purchaseStoreBrand any
-	if v, ok := fields["purchaseStoreBrand"]; ok {
-		purchaseStoreBrand = v
-	}
 	// ADR-051: the sender's label hints ride the add-op birth snapshot; persisted so state rows carry
 	// them for joiners. Present-keys-only, like every other field here — an absent key stays NULL.
 	var categoryHintName any
@@ -1038,31 +1221,21 @@ func insertItem(
 		quietUntilFirstPurchase = v
 	}
 
-	// Same rule as updateItem: attributed_to is the completer, so it is set only when
-	// this birth op asserts the item is checked. A fresh row has no standing completer,
-	// so where updateItem omits the column, here the natural value is NULL — there is
-	// nothing to preserve.
-	var attrParam any
-	if checked {
-		attrParam = userID
-	}
-
-	_, err := db.Exec(`
+	_, err := q.Exec(`
 		INSERT INTO items
-		    (id, cart_id, title, quantity, checked, notes, specification, urgency_level,
+		    (id, cart_id, title, quantity, notes, specification, urgency_level,
 		     global_id, frequency_days, is_active, paused_at, pause_reason, deferred_guess_date,
-		     deferred_guess_authored_at, purchased_at, purchase_store_brand,
-		     category_hint_name, category_hint_icon,
+		     deferred_guess_authored_at, category_hint_name, category_hint_icon,
 		     category_hint_color, store_hint_brand, last_wanted_at, quiet_until_first_purchase,
-		     attributed_to, ts, device_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, itemID, cartID, title, quantity, boolToInt(checked),
+		     ts, device_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, itemID, cartID, title, quantity,
 		notes, specification, urgencyLevel,
 		globalID, frequencyDays, boolToInt(isActive), pausedAt, pauseReason, deferredGuessDate,
-		deferredGuessAuthoredAt, purchasedAt, purchaseStoreBrand, categoryHintName, categoryHintIcon,
+		deferredGuessAuthoredAt, categoryHintName, categoryHintIcon,
 		categoryHintColor, storeHintBrand, lastWantedAt, boolToInt(quietUntilFirstPurchase),
-		attrParam, ts, deviceID)
-	return err == nil, err
+		ts, deviceID)
+	return err
 }
 
 // coerceInt asserts a JSON-decoded numeric field (float64) to an int SQL arg.
@@ -1103,34 +1276,20 @@ func coerceNumericOrNull(field string, v any) (any, bool) {
 	return int(f), true
 }
 
+// updateItem writes an op's content part over a row it won LWW against. Completion keys are
+// decideCompletion's and are never read here — so a rename never moves the completer, and an old
+// client's whole-row snapshot cannot write its stale checked state.
 func updateItem(
-	db *sql.DB,
+	q querier,
 	cartID, itemID, op string,
 	fields map[string]any,
 	ts float64,
-	deviceID, userID string,
-) (bool, error) {
+	deviceID string,
+) error {
 	// Build SET clause from fields that are present.
-	// ts and device_id move on every op.
+	// ts and device_id move on every op that wins LWW, whichever parts of it applied.
 	setClauses := "ts=?, device_id=?"
 	args := []any{ts, deviceID}
-
-	// attributed_to holds the COMPLETER of this purchase, not the actor of this op.
-	// So it moves only with an op that asserts something about completion:
-	//   - "checked": true   → this actor is the completer
-	//   - "checked": false  → the completion is retracted; no completer
-	//   - no "checked" key   → a rename, a quantity change, a recordQuiet says nothing
-	//     about who bought the item — leave the standing completer untouched by
-	//     omitting the column. (Writing NULL here is the bug this fix removes: it let
-	//     the last editor overwrite the checker.)
-	if c, ok := fields["checked"].(bool); ok {
-		setClauses += ", attributed_to=?"
-		if c {
-			args = append(args, userID)
-		} else {
-			args = append(args, nil)
-		}
-	}
 
 	// Only a deliberate re-add (op=="add") may clear a tombstone; an update must
 	// never resurrect (ADR-039). ApplyLWW already blocks update-over-tombstone,
@@ -1147,12 +1306,6 @@ func updateItem(
 		if q, ok := coerceInt("quantity", v); ok {
 			setClauses += ", quantity=?"
 			args = append(args, q)
-		}
-	}
-	if v, ok := fields["checked"]; ok {
-		if b, ok := coerceBool("checked", v); ok {
-			setClauses += ", checked=?"
-			args = append(args, boolToInt(b))
 		}
 	}
 	if v, ok := fields["notes"]; ok {
@@ -1203,28 +1356,6 @@ func updateItem(
 		setClauses += ", deferred_guess_authored_at=?"
 		args = append(args, v)
 	}
-	// R-585: on a checked:false op, purchasedAt and purchaseStoreBrand NAME the act being unchecked —
-	// they assert nothing. Storing them would record a cancelled purchase as the item's last one.
-	unchecking := false
-	if v, ok := fields["checked"]; ok {
-		if b, ok := coerceBool("checked", v); ok && !b {
-			unchecking = true
-		}
-	}
-	// ADR-050: persist the purchase fact when the op carries it (a checked-carrying op). Never cleared
-	// by an unchecked op — the field is simply absent there, leaving the last recorded fact intact.
-	if v, ok := fields["purchasedAt"]; ok && !unchecking {
-		setClauses += ", purchased_at=?"
-		args = append(args, v)
-	}
-	// The store half of that same fact. Present-keys-only, and gated the same way: an unchecked op
-	// leaves the last recorded value alone rather than clearing it. The relay stores the string and
-	// never interprets it — a brand is a label a member typed or a catalog supplied, not an identifier
-	// this server resolves.
-	if v, ok := fields["purchaseStoreBrand"]; ok && !unchecking {
-		setClauses += ", purchase_store_brand=?"
-		args = append(args, v)
-	}
 	// ADR-051: a member's manual relabel enqueues a field-targeted hint update. Present-keys-only —
 	// an absent hint key leaves the last recorded hint intact (never cleared by an unrelated op).
 	if v, ok := fields["categoryHintName"]; ok {
@@ -1251,7 +1382,7 @@ func updateItem(
 	}
 	// Set when a member asks for no predictions until the next purchase or the next Need Now,
 	// whichever comes first. An explicit key in THIS op is authoritative and wins outright — the
-	// derived clear below runs only when this op is silent on the flag.
+	// derived clears run only when this op is silent on the flag.
 	_, explicitQuiet := fields["quietUntilFirstPurchase"]
 	if v, ok := fields["quietUntilFirstPurchase"]; ok {
 		if b, ok := coerceBool("quietUntilFirstPurchase", v); ok {
@@ -1259,41 +1390,24 @@ func updateItem(
 			args = append(args, boolToInt(b))
 		}
 	}
-	// R-549: the silence is a derived fact, not a sticky one — a strictly newer purchase or want
-	// ends it, in the relay, so a build too old to ever send `false` still heals. "Strictly newer",
-	// not "present": the anti-entropy push-back re-asserts both facts unchanged on every reconnect,
+	// R-549: the silence is a derived fact, not a sticky one — a strictly newer want or purchase ends
+	// it, in the relay, so a build too old to ever send `false` still heals. This is the want half; the
+	// purchase half is decideCompletion's, because only it knows whether an act advanced. "Strictly
+	// newer", not "present": the anti-entropy push-back re-asserts the fact unchanged on every reconnect,
 	// and a present-key rule would let that re-assert undo a later ×. SQLite evaluates every SET
-	// expression against the OLD row, so the comparison lives in the same UPDATE as the writes above.
-	if !explicitQuiet {
-		purchasedAtVal, hasPurchasedAt := fields["purchasedAt"]
-		hasPurchasedAt = hasPurchasedAt && !unchecking // an uncheck names an act; it is not a purchase
-		lastWantedAtVal, hasLastWantedAt := fields["lastWantedAt"]
-		if hasPurchasedAt || hasLastWantedAt {
-			cond := ""
-			var condArgs []any
-			if hasPurchasedAt {
-				cond = "(purchased_at IS NULL OR ? > purchased_at)"
-				condArgs = append(condArgs, purchasedAtVal)
-			}
-			if hasLastWantedAt {
-				if cond != "" {
-					cond += " OR "
-				}
-				cond += "(last_wanted_at IS NULL OR ? > last_wanted_at)"
-				condArgs = append(condArgs, lastWantedAtVal)
-			}
-			setClauses += ", quiet_until_first_purchase = CASE WHEN " + cond +
-				" THEN 0 ELSE quiet_until_first_purchase END"
-			args = append(args, condArgs...)
-		}
+	// expression against the OLD row, so the comparison lives in the same UPDATE as the write above.
+	if v, ok := fields["lastWantedAt"]; ok && !explicitQuiet {
+		setClauses += ", quiet_until_first_purchase = CASE WHEN last_wanted_at IS NULL OR ? > last_wanted_at" +
+			" THEN 0 ELSE quiet_until_first_purchase END"
+		args = append(args, v)
 	}
 
 	args = append(args, itemID, cartID)
-	_, err := db.Exec(
+	_, err := q.Exec(
 		fmt.Sprintf(`UPDATE items SET %s WHERE id=? AND cart_id=?`, setClauses),
 		args...,
 	)
-	return err == nil, err
+	return err
 }
 
 func boolToInt(b bool) int {

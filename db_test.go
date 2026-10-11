@@ -32,6 +32,13 @@ func testDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// applyOp applies one op the way handleDelta does — content by LWW, completion by act — and reports
+// whether any part of it applied.
+func applyOp(db *sql.DB, cartID, itemID, op string, fields map[string]any, ts float64, deviceID, userID string) (bool, error) {
+	out, err := ApplyOp(db, cartID, itemID, op, fields, ts, deviceID, userID)
+	return out.Applied, err
+}
+
 func itemTitle(t *testing.T, db *sql.DB, cartID, itemID string) (title string, found bool) {
 	t.Helper()
 	err := db.QueryRow(
@@ -72,14 +79,14 @@ func itemQuantity(t *testing.T, db *sql.DB, cartID, itemID string) int {
 func TestApplyLWWWrongTypedFieldSkipped(t *testing.T) {
 	db := testDB(t)
 
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk", "quantity": float64(1)}, 1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add: ok=%v err=%v", ok, err)
 	}
 
 	// "quantity": "three" is a string where a number is required. The update must
 	// apply the good field (title) and skip the bad one (quantity) without panic.
-	ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"title": "Oat Milk", "quantity": "three"}, 2000, "dev-1", "user-a")
 	if err != nil || !ok {
 		t.Fatalf("update with wrong-typed field: ok=%v err=%v", ok, err)
@@ -98,17 +105,17 @@ func TestApplyLWWWrongTypedFieldSkipped(t *testing.T) {
 func TestApplyLWWUpdateDoesNotResurrectTombstone(t *testing.T) {
 	db := testDB(t)
 
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk"}, 1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add: ok=%v err=%v", ok, err)
 	}
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "delete",
+	if ok, err := applyOp(db, "cart-a", "item-1", "delete",
 		map[string]any{}, 2000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("delete: ok=%v err=%v", ok, err)
 	}
 
 	// Update with a newer ts than the tombstone — must be skipped, not applied.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"title": "Ghost"}, 3000, "dev-1", "user-a"); err != nil || ok {
 		t.Fatalf("update over tombstone: ok=%v err=%v, want ok=false", ok, err)
 	}
@@ -126,17 +133,17 @@ func TestApplyLWWUpdateDoesNotResurrectTombstone(t *testing.T) {
 func TestApplyLWWAddResurrectsTombstoneWithFullFields(t *testing.T) {
 	db := testDB(t)
 
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk", "quantity": float64(1)}, 1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add: ok=%v err=%v", ok, err)
 	}
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "delete",
+	if ok, err := applyOp(db, "cart-a", "item-1", "delete",
 		map[string]any{}, 2000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("delete: ok=%v err=%v", ok, err)
 	}
 
 	// A stale add (older than the tombstone) must NOT resurrect — deletion wins.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Stale", "quantity": float64(9)}, 1500, "dev-1", "user-a"); err != nil || ok {
 		t.Fatalf("stale add: ok=%v err=%v, want ok=false", ok, err)
 	}
@@ -145,7 +152,7 @@ func TestApplyLWWAddResurrectsTombstoneWithFullFields(t *testing.T) {
 	}
 
 	// A newer add resurrects with its full fields.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Reborn Milk", "quantity": float64(3)}, 3000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("re-add: ok=%v err=%v", ok, err)
 	}
@@ -190,11 +197,11 @@ func TestPruneDeletedItemsRetention(t *testing.T) {
 func TestApplyLWWSameItemIDInTwoCarts(t *testing.T) {
 	db := testDB(t)
 
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk in A"}, 1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add to cart-a: ok=%v err=%v", ok, err)
 	}
-	if ok, err := ApplyLWW(db, "cart-b", "item-1", "add",
+	if ok, err := applyOp(db, "cart-b", "item-1", "add",
 		map[string]any{"title": "Milk in B"}, 2000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add to cart-b: ok=%v err=%v", ok, err)
 	}
@@ -213,11 +220,11 @@ func TestApplyLWWSameItemIDInTwoCarts(t *testing.T) {
 func TestApplyLWWCrossCartDeleteInsertsTombstone(t *testing.T) {
 	db := testDB(t)
 
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk in A"}, 1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add to cart-a: ok=%v err=%v", ok, err)
 	}
-	if ok, err := ApplyLWW(db, "cart-b", "item-1", "delete",
+	if ok, err := applyOp(db, "cart-b", "item-1", "delete",
 		map[string]any{}, 2000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("delete in cart-b: ok=%v err=%v", ok, err)
 	}
@@ -271,7 +278,7 @@ func TestMigrateItemsCompositeKey(t *testing.T) {
 	if title, found := itemTitle(t, db, "cart-a", "item-1"); !found || title != "Legacy Milk" {
 		t.Errorf("migrated row: found=%v title=%q, want \"Legacy Milk\"", found, title)
 	}
-	if ok, err := ApplyLWW(db, "cart-b", "item-1", "add",
+	if ok, err := applyOp(db, "cart-b", "item-1", "add",
 		map[string]any{"title": "Milk in B"}, 2000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("post-migration add to cart-b: ok=%v err=%v", ok, err)
 	}
@@ -322,7 +329,7 @@ func TestPurchaseFactColumnMigration(t *testing.T) {
 	}
 
 	pa := 1_700_000_000.0
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk", "checked": true, "globalID": "g1", "purchasedAt": pa},
 		1_700_050_000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add carrying purchasedAt: ok=%v err=%v", ok, err)
@@ -385,7 +392,7 @@ func TestPurchaseStoreBrandColumnMigrationAndRoundTrip(t *testing.T) {
 
 	// (a) A checked `add` carrying the brand round-trips through the state door.
 	pa := 1_700_000_000.0
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk", "checked": true, "purchasedAt": pa, "purchaseStoreBrand": "FreshCo"},
 		1_700_050_000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add carrying purchaseStoreBrand: ok=%v err=%v", ok, err)
@@ -399,7 +406,7 @@ func TestPurchaseStoreBrandColumnMigrationAndRoundTrip(t *testing.T) {
 	}
 
 	// (b) An unchecked update omits the key entirely — present-keys-only leaves the recorded brand alone.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"title": "Whole Milk"},
 		1_700_060_000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("unchecked update: ok=%v err=%v", ok, err)
@@ -411,7 +418,7 @@ func TestPurchaseStoreBrandColumnMigrationAndRoundTrip(t *testing.T) {
 
 	// (c) A later purchase at a different shop replaces it. The brand names one purchase; it must not
 	// accumulate or stick.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"checked": true, "purchasedAt": pa + 604_800, "purchaseStoreBrand": "Costco"},
 		1_700_700_000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("second checked update: ok=%v err=%v", ok, err)
@@ -465,14 +472,14 @@ func TestAnchorAuthoredAtColumnMigrationAndFieldUpdate(t *testing.T) {
 		t.Fatal("migration did not add the deferred_guess_authored_at column")
 	}
 
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Shampoo"}, 1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add: ok=%v err=%v", ok, err)
 	}
 	// A defer authors the anchor: the anchor date AND its authorship instant ride together.
 	anchor := 1_700_000_000.0
 	authoredAt := 1_699_950_000.0
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"deferredGuessDate": anchor, "deferredGuessAuthoredAt": authoredAt},
 		2000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("anchor update: ok=%v err=%v", ok, err)
@@ -491,7 +498,7 @@ func TestAnchorAuthoredAtColumnMigrationAndFieldUpdate(t *testing.T) {
 	}
 
 	// A NSNull-paired clear (user clears the authored anchor): both columns wipe together.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"deferredGuessDate": nil, "deferredGuessAuthoredAt": nil},
 		3000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("anchor clear: ok=%v err=%v", ok, err)
@@ -507,27 +514,26 @@ func TestAnchorAuthoredAtColumnMigrationAndFieldUpdate(t *testing.T) {
 }
 
 // ADR-050 (b): a re-assert of a completion carrying the SAME purchase fact at a fresh (next-day) LWW ts
-// mints NO second consumption row — the fact-keyed PK + INSERT OR IGNORE collapse it. Pre-fix the row ts
-// (next day) would key a distinct PK and mint a phantom cross-day event.
+// mints NO second consumption row. Pre-ADR-050 the row ts (next day) keyed a distinct PK and minted a
+// phantom cross-day event. Since R-585 the re-assert is refused outright — it does not advance the act —
+// so nothing is captured at all; the fact-keyed PK is the second line of defence.
 func TestCaptureConsumptionReassertSameFactIsIdempotent(t *testing.T) {
 	db := testDB(t)
 	pa := 1_700_000_000.0 // the real purchase instant (day 1)
 
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk", "checked": true, "globalID": "g1", "purchasedAt": pa},
 		pa+3600, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("initial check-off: ok=%v err=%v", ok, err)
 	}
-	captureConsumption(db, "cart-a", "item-1", map[string]any{"checked": true}, 0)
 
 	// A stale device re-asserts checked:true the NEXT DAY (fresh op ts) but carrying the SAME fact.
 	nextDay := pa + 86_400 + 3600
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"checked": true, "purchasedAt": pa},
 		nextDay, "dev-2", "user-a"); err != nil || !ok {
 		t.Fatalf("stale re-assert: ok=%v err=%v", ok, err)
 	}
-	captureConsumption(db, "cart-a", "item-1", map[string]any{"checked": true}, 0)
 
 	events, err := GetConsumptionEvents(db, "cart-a", "g1")
 	if err != nil {
@@ -586,7 +592,7 @@ func TestLabelHintColumnsMigrationAndStateRoundTrip(t *testing.T) {
 	}
 
 	// Add carrying the sender's hints — they must ride the STATE row for joiners.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{
 			"title":             "Kale",
 			"categoryHintName":  "Produce",
@@ -597,7 +603,7 @@ func TestLabelHintColumnsMigrationAndStateRoundTrip(t *testing.T) {
 		t.Fatalf("add carrying hints: ok=%v err=%v", ok, err)
 	}
 	// Old-style add omitting every hint key must stay valid with nil hints.
-	if ok, err := ApplyLWW(db, "cart-a", "item-2", "add",
+	if ok, err := applyOp(db, "cart-a", "item-2", "add",
 		map[string]any{"title": "Milk"}, 1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("old-style add: ok=%v err=%v", ok, err)
 	}
@@ -638,12 +644,12 @@ func TestLabelHintColumnsMigrationAndStateRoundTrip(t *testing.T) {
 func TestLabelHintFieldUpdate(t *testing.T) {
 	db := testDB(t)
 
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Kale"}, 1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add: ok=%v err=%v", ok, err)
 	}
 	// A manual category reassignment enqueues just the hint fields.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"categoryHintName": "Greens", "categoryHintIcon": "leaf", "categoryHintColor": "#4CAF50"},
 		2000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("hint update: ok=%v err=%v", ok, err)
@@ -691,12 +697,12 @@ func TestAttributedToSurvivesAnEditByAnotherMember(t *testing.T) {
 	db := testDB(t)
 
 	// A checks the item off.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk"}, 1000, "dev-a", "user-a"); err != nil || !ok {
 		t.Fatalf("add: ok=%v err=%v", ok, err)
 	}
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
-		map[string]any{"checked": true}, 2000, "dev-a", "user-a"); err != nil || !ok {
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
+		map[string]any{"checked": true, "purchasedAt": 2000.0}, 2000, "dev-a", "user-a"); err != nil || !ok {
 		t.Fatalf("check off: ok=%v err=%v", ok, err)
 	}
 	if got := stateAttributedTo(t, db, "cart-a", "item-1"); got == nil || *got != "user-a" {
@@ -704,7 +710,7 @@ func TestAttributedToSurvivesAnEditByAnotherMember(t *testing.T) {
 	}
 
 	// B renames it. This asserts nothing about who bought it.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"title": "Whole Milk"}, 3000, "dev-b", "user-b"); err != nil || !ok {
 		t.Fatalf("rename: ok=%v err=%v", ok, err)
 	}
@@ -713,7 +719,7 @@ func TestAttributedToSurvivesAnEditByAnotherMember(t *testing.T) {
 	}
 
 	// A quantity change by B — same story.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"quantity": 2.0}, 4000, "dev-b", "user-b"); err != nil || !ok {
 		t.Fatalf("quantity change: ok=%v err=%v", ok, err)
 	}
@@ -722,11 +728,11 @@ func TestAttributedToSurvivesAnEditByAnotherMember(t *testing.T) {
 	}
 }
 
-// R-468 (b) — the completer moves with, and only with, an op that asserts completion.
+// R-468 (b) — the completer moves with, and only with, an op that moves the completion.
 func TestAttributedToTracksTheCheckedAssertion(t *testing.T) {
 	db := testDB(t)
 
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk"}, 1000, "dev-a", "user-a"); err != nil || !ok {
 		t.Fatalf("add: ok=%v err=%v", ok, err)
 	}
@@ -734,9 +740,10 @@ func TestAttributedToTracksTheCheckedAssertion(t *testing.T) {
 		t.Fatalf("a fresh unchecked add has a completer %v, want none", got)
 	}
 
-	// checked:true — the asserting actor becomes the completer.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
-		map[string]any{"checked": true}, 2000, "dev-b", "user-b"); err != nil || !ok {
+	// checked:true with its act — the asserting actor becomes the completer. (Since R-585 a checked:true
+	// without purchasedAt is no act, and moves nothing.)
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
+		map[string]any{"checked": true, "purchasedAt": 2000.0}, 2000, "dev-b", "user-b"); err != nil || !ok {
 		t.Fatalf("check off: ok=%v err=%v", ok, err)
 	}
 	if got := stateAttributedTo(t, db, "cart-a", "item-1"); got == nil || *got != "user-b" {
@@ -744,7 +751,7 @@ func TestAttributedToTracksTheCheckedAssertion(t *testing.T) {
 	}
 
 	// checked:false — the completion is retracted, so is the completer.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"checked": false}, 3000, "dev-a", "user-a"); err != nil || !ok {
 		t.Fatalf("uncheck: ok=%v err=%v", ok, err)
 	}
@@ -753,23 +760,28 @@ func TestAttributedToTracksTheCheckedAssertion(t *testing.T) {
 	}
 }
 
-// ADR-050 (c): an old client that omits purchasedAt falls back to the row ts — today's behaviour.
-func TestCaptureConsumptionFallsBackToTs(t *testing.T) {
+// R-585: a check-off without purchasedAt is no act, so nothing is recorded and the row stays unchecked.
+// This test used to pin the opposite — a fallback that stamped the reservoir with the op's ts — and that
+// fallback made up a purchase at an instant nobody bought anything. Every sender in the field has stamped
+// purchasedAt beside every check-off since ADR-050, so a checked:true without one is a stale mirror.
+func TestCheckOffWithoutPurchasedAtRecordsNothing(t *testing.T) {
 	db := testDB(t)
 	ts := 1_700_000_000.0
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk", "checked": true, "globalID": "g1"},
 		ts, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add without purchasedAt: ok=%v err=%v", ok, err)
 	}
-	captureConsumption(db, "cart-a", "item-1", map[string]any{"checked": true}, 0)
-
 	events, err := GetConsumptionEvents(db, "cart-a", "g1")
 	if err != nil {
 		t.Fatalf("GetConsumptionEvents: %v", err)
 	}
-	if len(events) != 1 || events[0] != ts {
-		t.Fatalf("absent purchasedAt: events=%v, want [%v] (fallback to ts)", events, ts)
+	if len(events) != 0 {
+		t.Fatalf("absent purchasedAt: events=%v, want none (no act, so nothing to record)", events)
+	}
+	items, _ := GetItems(db, "cart-a")
+	if len(items) != 1 || items[0].Checked || items[0].PurchasedAt != nil {
+		t.Fatalf("absent purchasedAt: state row = %+v, want unchecked with no act", items)
 	}
 }
 
@@ -779,12 +791,11 @@ func TestCaptureConsumptionConceptLessKeysOnItemID(t *testing.T) {
 	db := testDB(t)
 	pa := 1_700_000_000.0
 	// Concept-less: the add carries no globalID, so global_id stays NULL server-side.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "House Keeping", "checked": true, "purchasedAt": pa},
 		pa+3600, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("concept-less check-off: ok=%v err=%v", ok, err)
 	}
-	captureConsumption(db, "cart-a", "item-1", map[string]any{"checked": true}, 0)
 
 	// Nothing under a concept spine…
 	if events, err := GetConsumptionEvents(db, "cart-a", "g1"); err != nil || len(events) != 0 {
@@ -852,7 +863,7 @@ func TestWantedAndQuietColumnMigrationAndBirthOp(t *testing.T) {
 	// The live bug: a quiet item is BORN quiet, on the add op. A peer that was offline at that moment
 	// learns it only from the state snapshot.
 	wanted := 1_700_000_000.0
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Sunscreen", "quietUntilFirstPurchase": true, "lastWantedAt": wanted},
 		1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("quiet add: ok=%v err=%v", ok, err)
@@ -878,7 +889,7 @@ func TestWantedAndQuietColumnMigrationAndBirthOp(t *testing.T) {
 func TestWantedAndQuietFieldUpdateRoundTrip(t *testing.T) {
 	db := testDB(t)
 
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Shampoo"}, 1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add: ok=%v err=%v", ok, err)
 	}
@@ -892,7 +903,7 @@ func TestWantedAndQuietFieldUpdateRoundTrip(t *testing.T) {
 
 	// A member resumes the item and asks for silence until its next purchase.
 	wanted := 1_700_123_456.0
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"lastWantedAt": wanted, "quietUntilFirstPurchase": true},
 		2000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("wanted/quiet update: ok=%v err=%v", ok, err)
@@ -927,7 +938,7 @@ func TestWantedAndQuietFieldUpdateRoundTrip(t *testing.T) {
 	}
 
 	// An unrelated op must not clear either fact — present-keys-only.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"quantity": 3.0}, 3000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("unrelated update: ok=%v err=%v", ok, err)
 	}
@@ -941,7 +952,7 @@ func TestWantedAndQuietFieldUpdateRoundTrip(t *testing.T) {
 	}
 
 	// The purchase arrives: the client sends the flag false and the silence ends.
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	if ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"checked": true, "quietUntilFirstPurchase": false},
 		4000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("purchase update: ok=%v err=%v", ok, err)
@@ -1037,8 +1048,10 @@ func TestCompositeKeyRebuildCarriesWantedAndQuiet(t *testing.T) {
 func TestQuietDerivedClear(t *testing.T) {
 	seed := func(t *testing.T, db *sql.DB) {
 		t.Helper()
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
-			map[string]any{"title": "Sunscreen", "purchasedAt": 1000.0, "lastWantedAt": 1000.0,
+		// checked:true beside the act: since R-585 a purchasedAt with no checked is no act, and the
+		// re-assert subtest below needs the act stored to compare against.
+		if ok, err := applyOp(db, "cart-a", "item-1", "add",
+			map[string]any{"title": "Sunscreen", "checked": true, "purchasedAt": 1000.0, "lastWantedAt": 1000.0,
 				"quietUntilFirstPurchase": true},
 			1000, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("seed quiet item: ok=%v err=%v", ok, err)
@@ -1056,7 +1069,7 @@ func TestQuietDerivedClear(t *testing.T) {
 	t.Run("a newer purchase clears", func(t *testing.T) {
 		db := testDB(t)
 		seed(t, db)
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		if ok, err := applyOp(db, "cart-a", "item-1", "update",
 			map[string]any{"checked": true, "purchasedAt": 2000.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("purchase update: ok=%v err=%v", ok, err)
 		}
@@ -1069,7 +1082,7 @@ func TestQuietDerivedClear(t *testing.T) {
 		db := testDB(t)
 		seed(t, db)
 		// The anti-entropy push-back: re-asserts the same fact, unchanged.
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		if ok, err := applyOp(db, "cart-a", "item-1", "update",
 			map[string]any{"checked": true, "purchasedAt": 1000.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("push-back update: ok=%v err=%v", ok, err)
 		}
@@ -1081,7 +1094,7 @@ func TestQuietDerivedClear(t *testing.T) {
 	t.Run("a newer want clears", func(t *testing.T) {
 		db := testDB(t)
 		seed(t, db)
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		if ok, err := applyOp(db, "cart-a", "item-1", "update",
 			map[string]any{"lastWantedAt": 2000.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("want update: ok=%v err=%v", ok, err)
 		}
@@ -1093,7 +1106,7 @@ func TestQuietDerivedClear(t *testing.T) {
 	t.Run("an equal or older want does not clear", func(t *testing.T) {
 		db := testDB(t)
 		seed(t, db)
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		if ok, err := applyOp(db, "cart-a", "item-1", "update",
 			map[string]any{"lastWantedAt": 1000.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("equal want update: ok=%v err=%v", ok, err)
 		}
@@ -1103,7 +1116,7 @@ func TestQuietDerivedClear(t *testing.T) {
 
 		db2 := testDB(t)
 		seed(t, db2)
-		if ok, err := ApplyLWW(db2, "cart-a", "item-1", "update",
+		if ok, err := applyOp(db2, "cart-a", "item-1", "update",
 			map[string]any{"lastWantedAt": 500.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("older want update: ok=%v err=%v", ok, err)
 		}
@@ -1115,7 +1128,7 @@ func TestQuietDerivedClear(t *testing.T) {
 	t.Run("an explicit true in the same op wins over the derived clear", func(t *testing.T) {
 		db := testDB(t)
 		seed(t, db)
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		if ok, err := applyOp(db, "cart-a", "item-1", "update",
 			map[string]any{"checked": true, "purchasedAt": 2000.0, "quietUntilFirstPurchase": true},
 			2000, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("purchase-with-explicit-quiet update: ok=%v err=%v", ok, err)
@@ -1128,7 +1141,7 @@ func TestQuietDerivedClear(t *testing.T) {
 	t.Run("the state read returns false after a clear", func(t *testing.T) {
 		db := testDB(t)
 		seed(t, db)
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		if ok, err := applyOp(db, "cart-a", "item-1", "update",
 			map[string]any{"checked": true, "purchasedAt": 2000.0}, 2000, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("purchase update: ok=%v err=%v", ok, err)
 		}
@@ -1272,7 +1285,7 @@ func TestDeleteRoomCascadesToEveryDependentTable(t *testing.T) {
 	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
 		t.Fatalf("AddMember: %v", err)
 	}
-	if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	if ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk"}, 1000, "dev-1", "user-a"); err != nil || !ok {
 		t.Fatalf("add item: ok=%v err=%v", ok, err)
 	}
@@ -1470,7 +1483,7 @@ func TestGetMembersSurvivesAMissingRoomRow(t *testing.T) {
 func TestApplyLWWUpdateOnMissingRowIsDiscarded(t *testing.T) {
 	db := testDB(t)
 
-	ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+	ok, err := applyOp(db, "cart-a", "item-1", "update",
 		map[string]any{"notes": "oat"}, 1000, "dev-1", "user-a")
 	if err != nil || ok {
 		t.Fatalf("update on missing row: ok=%v err=%v, want ok=false", ok, err)
@@ -1484,7 +1497,7 @@ func TestApplyLWWUpdateOnMissingRowIsDiscarded(t *testing.T) {
 func TestApplyLWWAddOnMissingRowInserts(t *testing.T) {
 	db := testDB(t)
 
-	ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+	ok, err := applyOp(db, "cart-a", "item-1", "add",
 		map[string]any{"title": "Milk", "quantity": float64(2)}, 1000, "dev-1", "user-a")
 	if err != nil || !ok {
 		t.Fatalf("add on missing row: ok=%v err=%v, want ok=true", ok, err)
@@ -1497,13 +1510,16 @@ func TestApplyLWWAddOnMissingRowInserts(t *testing.T) {
 	}
 }
 
-// R-585 A: on a checked:false op, purchasedAt and purchaseStoreBrand NAME the act being unchecked —
-// they assert nothing, so the update path must neither store them nor let them end a silence.
+// R-585: on a checked:false op, purchasedAt NAMES the act being unchecked and purchaseStoreBrand asserts
+// nothing. Without a verdict the named act is never stored. With cancels:true naming a LATER act it is —
+// the uncheck reached the relay before its own check-off, and the register advances to the cancelled act
+// so the late check-off is refused (this subtest pinned "never stored" before the relay round). An
+// uncheck never stores its brand and never ends a silence.
 func TestUncheckNamesActWithoutStoringIt(t *testing.T) {
 	seed := func(t *testing.T) *sql.DB {
 		t.Helper()
 		db := testDB(t)
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "add",
+		if ok, err := applyOp(db, "cart-a", "item-1", "add",
 			map[string]any{"title": "Sunscreen", "checked": true, "purchasedAt": 1000.0,
 				"purchaseStoreBrand": "Acme", "quietUntilFirstPurchase": true},
 			1000, "dev-1", "user-a"); err != nil || !ok {
@@ -1512,10 +1528,10 @@ func TestUncheckNamesActWithoutStoringIt(t *testing.T) {
 		return db
 	}
 
-	t.Run("an uncheck stores neither the named act nor its store", func(t *testing.T) {
+	t.Run("an uncheck without a verdict stores neither the named act nor its store", func(t *testing.T) {
 		db := seed(t)
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
-			map[string]any{"checked": false, "purchasedAt": 2000.0, "purchaseStoreBrand": "Other", "cancels": true},
+		if ok, err := applyOp(db, "cart-a", "item-1", "update",
+			map[string]any{"checked": false, "purchasedAt": 2000.0, "purchaseStoreBrand": "Other"},
 			2001, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("uncheck: ok=%v err=%v", ok, err)
 		}
@@ -1530,9 +1546,29 @@ func TestUncheckNamesActWithoutStoringIt(t *testing.T) {
 		}
 	})
 
+	t.Run("a cancel naming a later act advances the register, and stores no brand", func(t *testing.T) {
+		db := seed(t)
+		if ok, err := applyOp(db, "cart-a", "item-1", "update",
+			map[string]any{"checked": false, "purchasedAt": 2000.0, "purchaseStoreBrand": "Other", "cancels": true},
+			2001, "dev-1", "user-a"); err != nil || !ok {
+			t.Fatalf("uncheck: ok=%v err=%v", ok, err)
+		}
+		var pa float64
+		var brand sql.NullString
+		var checked, cancelled int
+		if err := db.QueryRow(`SELECT purchased_at, purchase_store_brand, checked, purchase_cancelled FROM items WHERE id='item-1'`).
+			Scan(&pa, &brand, &checked, &cancelled); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if pa != 2000.0 || brand.Valid || checked != 0 || cancelled != 1 {
+			t.Errorf("row = purchased_at %v brand %v checked %d cancelled %d, want 2000 / NULL / 0 / 1",
+				pa, brand, checked, cancelled)
+		}
+	})
+
 	t.Run("an uncheck naming a newer act does not end the silence", func(t *testing.T) {
 		db := seed(t)
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		if ok, err := applyOp(db, "cart-a", "item-1", "update",
 			map[string]any{"checked": false, "purchasedAt": 2000.0}, 2001, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("uncheck: ok=%v err=%v", ok, err)
 		}
@@ -1547,7 +1583,7 @@ func TestUncheckNamesActWithoutStoringIt(t *testing.T) {
 
 	t.Run("an uncheck carrying a newer lastWantedAt still clears the silence", func(t *testing.T) {
 		db := seed(t)
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update",
+		if ok, err := applyOp(db, "cart-a", "item-1", "update",
 			map[string]any{"checked": false, "purchasedAt": 2000.0, "lastWantedAt": 3000.0},
 			3001, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("uncheck+want: ok=%v err=%v", ok, err)
@@ -1559,17 +1595,17 @@ func TestUncheckNamesActWithoutStoringIt(t *testing.T) {
 	})
 }
 
-// R-585 A: captureConsumption follows the uncheck author's verdict.
+// R-585: the reservoir follows the uncheck author's verdict, which the completion owner reads; it is
+// driven through the composed apply now, since the act it moves is decided there and handed over.
 func TestCaptureConsumptionFollowsCancelsVerdict(t *testing.T) {
 	const act = 1_700_000_000.0
 	seed := func(t *testing.T) *sql.DB {
 		t.Helper()
 		db := testDB(t)
 		fields := map[string]any{"title": "Milk", "checked": true, "globalID": "g1", "purchasedAt": act}
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "add", fields, act+5, "dev-1", "user-a"); err != nil || !ok {
+		if ok, err := applyOp(db, "cart-a", "item-1", "add", fields, act+5, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("seed: ok=%v err=%v", ok, err)
 		}
-		captureConsumption(db, "cart-a", "item-1", fields, act+5)
 		// An older, legitimate act the verdict must never touch.
 		if _, err := db.Exec(`INSERT INTO consumption_events (cart_id, global_id, ts) VALUES ('cart-a','g1',?)`,
 			act-86_400); err != nil {
@@ -1579,10 +1615,9 @@ func TestCaptureConsumptionFollowsCancelsVerdict(t *testing.T) {
 	}
 	uncheck := func(t *testing.T, db *sql.DB, fields map[string]any, rawTs float64) {
 		t.Helper()
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "update", fields, rawTs, "dev-1", "user-a"); err != nil || !ok {
+		if ok, err := applyOp(db, "cart-a", "item-1", "update", fields, rawTs, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("uncheck: ok=%v err=%v", ok, err)
 		}
-		captureConsumption(db, "cart-a", "item-1", fields, rawTs)
 	}
 	events := func(t *testing.T, db *sql.DB) []float64 {
 		t.Helper()
@@ -1603,15 +1638,22 @@ func TestCaptureConsumptionFollowsCancelsVerdict(t *testing.T) {
 		}
 	})
 
-	t.Run("cancels:true without purchasedAt falls back to the stored act", func(t *testing.T) {
+	// It used to fall back to the row's stored act. A verdict without the act it judges is no verdict:
+	// the shape is the no-verdict one, and the 30 s window decides.
+	t.Run("cancels:true without purchasedAt is the no-verdict shape", func(t *testing.T) {
 		db := seed(t)
 		uncheck(t, db, map[string]any{"checked": false, "cancels": true}, act+7200)
+		if ev := events(t, db); len(ev) != 2 {
+			t.Fatalf("outside window: events=%v, want both rows kept", ev)
+		}
+		db = seed(t)
+		uncheck(t, db, map[string]any{"checked": false, "cancels": true}, act+10)
 		if ev := events(t, db); len(ev) != 1 || ev[0] != act-86_400 {
-			t.Fatalf("events=%v, want only the older act", ev)
+			t.Fatalf("inside window: events=%v, want only the older act", ev)
 		}
 	})
 
-	t.Run("cancels:true naming an act with no row does nothing", func(t *testing.T) {
+	t.Run("cancels:true naming an act with no row deletes nothing", func(t *testing.T) {
 		db := seed(t)
 		uncheck(t, db, map[string]any{"checked": false, "purchasedAt": act + 999, "cancels": true}, act+7)
 		if ev := events(t, db); len(ev) != 2 {
@@ -1640,19 +1682,21 @@ func TestCaptureConsumptionFollowsCancelsVerdict(t *testing.T) {
 		}
 	})
 
+	// An act can no longer sit beyond the relay's clock + 60 s (that is no act), so the case where the
+	// clamp matters runs the other way: a fast client's uncheck whose raw ts is outside the window while
+	// the clamped value would fall inside it.
 	t.Run("the window compares the raw op ts, not the clamped stored one", func(t *testing.T) {
 		db := testDB(t)
 		now := float64(time.Now().Unix())
-		fact := now + 600 // a skewed client: its clock runs ~10 min ahead of the relay
+		fact := now + 50 // a valid act, just inside the relay's clock + 60 s
 		fields := map[string]any{"title": "Milk", "checked": true, "globalID": "g1", "purchasedAt": fact}
-		if ok, err := ApplyLWW(db, "cart-a", "item-1", "add", fields, now, "dev-1", "user-a"); err != nil || !ok {
+		if ok, err := applyOp(db, "cart-a", "item-1", "add", fields, now, "dev-1", "user-a"); err != nil || !ok {
 			t.Fatalf("seed: ok=%v err=%v", ok, err)
 		}
-		captureConsumption(db, "cart-a", "item-1", fields, now)
-		// Raw ts is 5 s after the fact; LWW stores it clamped to now+60, ~9 min before the fact.
-		uncheck(t, db, map[string]any{"checked": false}, fact+5)
-		if ev, _ := GetConsumptionEvents(db, "cart-a", "g1"); len(ev) != 0 {
-			t.Fatalf("events=%v, want the act retracted (raw ts is 5 s after it)", ev)
+		// Raw ts is 50 s after the act; LWW clamps it to the relay's now + 60, ~10 s after it.
+		uncheck(t, db, map[string]any{"checked": false}, fact+50)
+		if ev, _ := GetConsumptionEvents(db, "cart-a", "g1"); len(ev) != 1 {
+			t.Fatalf("events=%v, want the act kept (raw ts is 50 s after it, outside the window)", ev)
 		}
 	})
 }
