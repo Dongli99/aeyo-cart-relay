@@ -157,8 +157,13 @@ The parts that matter for privacy, with somewhere to check each:
 - **A capped log of check-off timestamps** is kept per cart and item lineage, so a member who
   joins later can warm-start their cadence learning instead of starting blind. It is capped
   at 20 rows and holds timestamps only — no prices, no locations, no receipts.
-- **No location, ever.** There is no location column, no location field on the wire, and no
-  code path that receives one. Aeyo uses location on-device only.
+- **No stored location.** There is no location column, and no GPS reading, address or place
+  crosses the wire. One value does say something about where a person is. A check-off can
+  carry the buyer's time zone at that moment, as an offset from UTC (`purchaseUTCOffset`), so
+  the other members date the purchase on the buyer's own calendar day. The relay passes it to
+  the cart's members with that check-off and never stores it ([`db.go`](db.go),
+  `completionKeys`). An offset places a person within a band of time zones, which is why it is
+  named here.
 - **No analytics, no third-party services, no outbound requests.** This binary talks to
   SQLite on local disk and to connected clients. That is the complete list.
 
