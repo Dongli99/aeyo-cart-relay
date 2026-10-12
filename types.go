@@ -165,7 +165,7 @@ type ItemRow struct {
 	// The clear is DERIVED, not sent: no client ever puts `false` on the wire for this key (R-549).
 	// The relay itself clears the persisted column when a check-off advances the item's act
 	// (decideCompletion in db.go) or an op's lastWantedAt is strictly newer than the stored one
-	// (updateItem) — that is what lets an old build, which will never send the key, still heal on its
+	// (decideWant) — that is what lets an old build, which will never send the key, still heal on its
 	// next purchase or want.
 	//
 	// The name says "first" and the meaning is the NEXT purchase. That is deliberate: the key is the

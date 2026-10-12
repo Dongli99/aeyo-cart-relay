@@ -884,40 +884,87 @@ func ApplyOp(
 
 	won := lww == lwwWon
 	var row completionPair
+	var wanted sql.NullFloat64
 	var deleted bool
 	if err := tx.QueryRow(`
-		SELECT checked, purchased_at, attributed_to, purchase_store_brand, COALESCE(purchase_cancelled,0), deleted
+		SELECT checked, purchased_at, attributed_to, purchase_store_brand, COALESCE(purchase_cancelled,0), last_wanted_at, deleted
 		FROM items WHERE id=? AND cart_id=?
-	`, itemID, cartID).Scan(&row.checked, &row.purchasedAt, &row.completer, &row.brand, &row.cancelled, &deleted); err != nil {
+	`, itemID, cartID).Scan(&row.checked, &row.purchasedAt, &row.completer, &row.brand, &row.cancelled, &wanted, &deleted); err != nil {
 		return OpOutcome{}, err
 	}
 	var v completionVerdict
-	if !deleted { // an add that lost LWW to a stale tombstone left the row deleted: no act lands on it
-		v = decideCompletion(op, fields, won, row, float64(time.Now().Unix()), ts, userID)
+	var w wantVerdict
+	if !deleted { // an add that lost LWW to a stale tombstone left the row deleted: no act or want lands on it
+		now := float64(time.Now().Unix())
+		v = decideCompletion(op, fields, won, row, now, ts, userID)
+		w = decideWant(fields, wanted, now)
 	}
-	if v.next != row || v.clearQuiet {
+	// The silence a member asked for ends on a check-off that advanced the act, or on a want that advanced
+	// the register — unless this op won LWW and sets the flag itself, which is then authoritative. A losing
+	// op's flag is stale content, but its act or want still ends the silence.
+	_, explicitQuiet := fields["quietUntilFirstPurchase"]
+	clearQuiet := v.clearQuiet || w.advanced && !(won && explicitQuiet)
+	if v.next != row || w.advanced || clearQuiet {
 		if _, err := tx.Exec(`
 			UPDATE items SET checked=?, purchased_at=?, attributed_to=?, purchase_store_brand=?, purchase_cancelled=?,
+			    last_wanted_at=?,
 			    quiet_until_first_purchase = CASE WHEN ? THEN 0 ELSE quiet_until_first_purchase END
 			WHERE id=? AND cart_id=?
 		`, boolToInt(v.next.checked), v.next.purchasedAt, v.next.completer, v.next.brand, boolToInt(v.next.cancelled),
-			v.clearQuiet, itemID, cartID); err != nil {
+			w.next, clearQuiet, itemID, cartID); err != nil {
 			return OpOutcome{}, err
 		}
 	}
 	captureConsumption(tx, cartID, itemID, v.capture)
 
-	out := OpOutcome{Applied: won || v.tookEffect}
+	out := OpOutcome{Applied: won || v.tookEffect || w.advanced}
 	for k, val := range fields {
-		if completionKeys[k] && v.tookEffect || !completionKeys[k] && won {
-			if out.Fields == nil {
-				out.Fields = map[string]any{}
+		switch {
+		case k == wantKey:
+			if !w.advanced {
+				continue
 			}
-			out.Fields[k] = val
+		case completionKeys[k]:
+			if !v.tookEffect {
+				continue
+			}
+		case !won:
+			continue
 		}
+		if out.Fields == nil {
+			out.Fields = map[string]any{}
+		}
+		out.Fields[k] = val
 	}
 	out.Broadcast = len(out.Fields) > 0
 	return out, tx.Commit()
+}
+
+// wantKey is the wire key of a member's latest want. It is neither content nor completion: a fact with
+// its own register, decideWant's.
+const wantKey = "lastWantedAt"
+
+// wantVerdict is decideWant's ruling on one op.
+type wantVerdict struct {
+	next     sql.NullFloat64 // the register after the op
+	advanced bool            // the op moved the register: its key goes to peers
+}
+
+// decideWant is the one owner of last_wanted_at: a monotone register, the max of the stored instant and
+// the op's, applied whenever the op passes the whole-op guards, whether or not its content won LWW.
+// Members re-assert an item's whole content, want included, and rely on receivers only moving forward — an
+// older want riding a newer rename must not drag the row back, and a newer want riding an older rename
+// must not be lost. A non-numeric value, or one past now + actSkew, is no want: admitted, a far-future
+// instant would sit above every real want and refuse them all.
+func decideWant(fields map[string]any, stored sql.NullFloat64, now float64) wantVerdict {
+	v := wantVerdict{next: stored}
+	t, ok := fields[wantKey].(float64)
+	if !ok || t > now+actSkew || stored.Valid && t <= stored.Float64 {
+		return v
+	}
+	v.next = sql.NullFloat64{Float64: t, Valid: true}
+	v.advanced = true
+	return v
 }
 
 // completionPair is an item row's completion state. (checked, purchasedAt) is a monotone register on the
@@ -1133,6 +1180,7 @@ func ApplyLWW(
 
 // insertItem creates a row from an add's content part. Its completion columns start empty — an
 // unchecked item nobody has bought — and decideCompletion applies the add's act, if it carries one.
+// The want register starts empty too: decideWant applies the add's lastWantedAt.
 func insertItem(
 	q querier,
 	cartID, itemID string,
@@ -1208,12 +1256,6 @@ func insertItem(
 	if v, ok := fields["storeHintBrand"]; ok {
 		storeHintBrand = v
 	}
-	// The instant a member last re-confirmed wanting this item. Persisted so it rides the reconnect
-	// snapshot, not only a live message — a device that was offline still learns the item was wanted.
-	var lastWantedAt any
-	if v, ok := fields["lastWantedAt"]; ok {
-		lastWantedAt = v
-	}
 	// "Predict nothing about this item until its next purchase." Present-keys-only like the rest; an
 	// absent key leaves the flag off. (The wire key says "first"; the meaning is the next purchase.)
 	quietUntilFirstPurchase := false
@@ -1226,14 +1268,14 @@ func insertItem(
 		    (id, cart_id, title, quantity, notes, specification, urgency_level,
 		     global_id, frequency_days, is_active, paused_at, pause_reason, deferred_guess_date,
 		     deferred_guess_authored_at, category_hint_name, category_hint_icon,
-		     category_hint_color, store_hint_brand, last_wanted_at, quiet_until_first_purchase,
+		     category_hint_color, store_hint_brand, quiet_until_first_purchase,
 		     ts, device_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, itemID, cartID, title, quantity,
 		notes, specification, urgencyLevel,
 		globalID, frequencyDays, boolToInt(isActive), pausedAt, pauseReason, deferredGuessDate,
 		deferredGuessAuthoredAt, categoryHintName, categoryHintIcon,
-		categoryHintColor, storeHintBrand, lastWantedAt, boolToInt(quietUntilFirstPurchase),
+		categoryHintColor, storeHintBrand, boolToInt(quietUntilFirstPurchase),
 		ts, deviceID)
 	return err
 }
@@ -1374,34 +1416,15 @@ func updateItem(
 		setClauses += ", store_hint_brand=?"
 		args = append(args, v)
 	}
-	// A member re-confirming they still want the item stamps this. Present-keys-only — an unrelated op
-	// never clears it, so the last re-confirmation stands until a newer one replaces it.
-	if v, ok := fields["lastWantedAt"]; ok {
-		setClauses += ", last_wanted_at=?"
-		args = append(args, v)
-	}
 	// Set when a member asks for no predictions until the next purchase or the next Need Now,
 	// whichever comes first. An explicit key in THIS op is authoritative and wins outright — the
 	// derived clears run only when this op is silent on the flag.
-	_, explicitQuiet := fields["quietUntilFirstPurchase"]
 	if v, ok := fields["quietUntilFirstPurchase"]; ok {
 		if b, ok := coerceBool("quietUntilFirstPurchase", v); ok {
 			setClauses += ", quiet_until_first_purchase=?"
 			args = append(args, boolToInt(b))
 		}
 	}
-	// R-549: the silence is a derived fact, not a sticky one — a strictly newer want or purchase ends
-	// it, in the relay, so a build too old to ever send `false` still heals. This is the want half; the
-	// purchase half is decideCompletion's, because only it knows whether an act advanced. "Strictly
-	// newer", not "present": the anti-entropy push-back re-asserts the fact unchanged on every reconnect,
-	// and a present-key rule would let that re-assert undo a later ×. SQLite evaluates every SET
-	// expression against the OLD row, so the comparison lives in the same UPDATE as the write above.
-	if v, ok := fields["lastWantedAt"]; ok && !explicitQuiet {
-		setClauses += ", quiet_until_first_purchase = CASE WHEN last_wanted_at IS NULL OR ? > last_wanted_at" +
-			" THEN 0 ELSE quiet_until_first_purchase END"
-		args = append(args, v)
-	}
-
 	args = append(args, itemID, cartID)
 	_, err := q.Exec(
 		fmt.Sprintf(`UPDATE items SET %s WHERE id=? AND cart_id=?`, setClauses),
