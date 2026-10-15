@@ -290,7 +290,7 @@ func joinCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		// Notify existing connected members of the new joiner via a full state snapshot.
 		// The joiner is not yet connected over WS (they open it after this HTTP call),
 		// so this only reaches already-connected members.
-		stateB, _ := json.Marshal(buildStateMsg(db, hub, body.CartID))
+		stateB, _ := json.Marshal(buildStateMsg(db, body.CartID))
 		hub.BroadcastToCart(body.CartID, stateB, "")
 
 		members, _ := GetMembers(db, body.CartID)
@@ -404,7 +404,7 @@ func leaveCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		// broadcast because the leaver's row is gone by this point — a snapshot taken
 		// earlier would re-assert the member this call is removing.
 		if transferred {
-			stateB, _ := json.Marshal(buildStateMsg(db, hub, body.CartID))
+			stateB, _ := json.Marshal(buildStateMsg(db, body.CartID))
 			hub.BroadcastToCart(body.CartID, stateB, "")
 		}
 
@@ -587,7 +587,7 @@ func transferHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		// tier change. owner_transferred carries no members, so without this the new owner
 		// keeps the empty tier they held as an ordinary member until some other write
 		// happens to produce a state message.
-		stateB, _ := json.Marshal(buildStateMsg(db, hub, body.CartID))
+		stateB, _ := json.Marshal(buildStateMsg(db, body.CartID))
 		hub.BroadcastToCart(body.CartID, stateB, "")
 
 		writeJSON(w, http.StatusOK, map[string]any{})
@@ -638,12 +638,11 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 // buildStateMsg — shared state-snapshot helper
 // ---------------------------------------------------------------------------
 
-func buildStateMsg(db *sql.DB, hub *Hub, cartID string) StateMsg {
+func buildStateMsg(db *sql.DB, cartID string) StateMsg {
 	ownerID, _ := GetOwner(db, cartID)
 	members, _ := GetMembers(db, cartID)
 	items, _ := GetItems(db, cartID)
 	tombstones, _ := GetTombstones(db, cartID)
-	activeShopping := hub.GetActiveShopping(cartID)
 
 	if items == nil {
 		items = []ItemRow{}
@@ -653,9 +652,6 @@ func buildStateMsg(db *sql.DB, hub *Hub, cartID string) StateMsg {
 	}
 	if tombstones == nil {
 		tombstones = []TombstoneRow{}
-	}
-	if activeShopping == nil {
-		activeShopping = []ActiveShoppingEntry{}
 	}
 
 	// premiumForAll (TestFlight): report the OWNER as premium so the client's optimistic frozen
@@ -673,15 +669,14 @@ func buildStateMsg(db *sql.DB, hub *Hub, cartID string) StateMsg {
 	}
 
 	return StateMsg{
-		Type:                  "state",
-		V:                     protocolVersion,
-		MinV:                  minClientVersion,
-		CartID:                cartID,
-		OwnerID:               ownerID,
-		Items:                 items,
-		Members:               members,
-		ActiveShoppingMembers: activeShopping,
-		Tombstones:            tombstones,
+		Type:       "state",
+		V:          protocolVersion,
+		MinV:       minClientVersion,
+		CartID:     cartID,
+		OwnerID:    ownerID,
+		Items:      items,
+		Members:    members,
+		Tombstones: tombstones,
 	}
 }
 
@@ -804,7 +799,7 @@ func wsHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		})
 		// One state snapshot per subscribed cart.
 		for _, cartID := range accepted {
-			sendJSON(client, buildStateMsg(db, hub, cartID))
+			sendJSON(client, buildStateMsg(db, cartID))
 		}
 
 		go writePump(client)

@@ -86,18 +86,16 @@ type Client struct {
 // The second is derived from the subscription sets and maintained wherever they
 // change, so a broadcast never walks every connection asking.
 type Hub struct {
-	mu             sync.RWMutex
-	clients        map[string]map[*Client]bool  // userID → set of clients
-	cartIndex      map[string]map[*Client]bool  // cartID → set of subscribed clients
-	activeShopping map[string]map[string]string // cartID → userID → storeID
+	mu        sync.RWMutex
+	clients   map[string]map[*Client]bool // userID → set of clients
+	cartIndex map[string]map[*Client]bool // cartID → set of subscribed clients
 }
 
 // NewHub constructs an empty Hub.
 func NewHub() *Hub {
 	return &Hub{
-		clients:        make(map[string]map[*Client]bool),
-		cartIndex:      make(map[string]map[*Client]bool),
-		activeShopping: make(map[string]map[string]string),
+		clients:   make(map[string]map[*Client]bool),
+		cartIndex: make(map[string]map[*Client]bool),
 	}
 }
 
@@ -202,19 +200,10 @@ func (h *Hub) removeFromCartIndexLocked(c *Client, cartID string) {
 	}
 }
 
-// Unregister removes a client. It relays member_session_end for EVERY cart the
-// connection was active-shopping in — a connection now carries several, and a
-// drop ends presence in all of them at once.
+// Unregister removes a client from the hub and from every cart it was subscribed to.
 func (h *Hub) Unregister(c *Client) {
 	h.mu.Lock()
-	var endedCarts []string
 	for cartID := range c.subscribed {
-		if h.activeShopping[cartID] != nil {
-			if _, ok := h.activeShopping[cartID][c.userID]; ok {
-				delete(h.activeShopping[cartID], c.userID)
-				endedCarts = append(endedCarts, cartID)
-			}
-		}
 		h.removeFromCartIndexLocked(c, cartID)
 	}
 	c.subscribed = make(map[string]bool)
@@ -225,12 +214,6 @@ func (h *Hub) Unregister(c *Client) {
 		}
 	}
 	h.mu.Unlock()
-
-	for _, cartID := range endedCarts {
-		msg := MemberSessionMsg{Type: "member_session_end", CartID: cartID, UserID: c.userID}
-		b, _ := json.Marshal(msg)
-		h.BroadcastToCart(cartID, b, c.deviceID)
-	}
 }
 
 // BroadcastToCart sends msg to all clients subscribed to cartID except the one
@@ -266,36 +249,6 @@ func (h *Hub) BroadcastToCartExcludeUser(cartID string, msg []byte, excludeUserI
 			log.Printf("hub: dropping message for slow client %s/%s", cartID, c.userID)
 		}
 	}
-}
-
-// SetActiveShopping records that userID is shopping at storeID in cartID.
-func (h *Hub) SetActiveShopping(cartID, userID, storeID string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.activeShopping[cartID] == nil {
-		h.activeShopping[cartID] = make(map[string]string)
-	}
-	h.activeShopping[cartID][userID] = storeID
-}
-
-// ClearActiveShopping removes userID from the active-shopping set for cartID.
-func (h *Hub) ClearActiveShopping(cartID, userID string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.activeShopping[cartID] != nil {
-		delete(h.activeShopping[cartID], userID)
-	}
-}
-
-// GetActiveShopping returns all active-shopping entries for a cart.
-func (h *Hub) GetActiveShopping(cartID string) []ActiveShoppingEntry {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	var entries []ActiveShoppingEntry
-	for uid, sid := range h.activeShopping[cartID] {
-		entries = append(entries, ActiveShoppingEntry{UserID: uid, StoreID: sid})
-	}
-	return entries
 }
 
 // ---------------------------------------------------------------------------
@@ -418,10 +371,6 @@ func handleMessage(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 		handleSubscribe(c, h, db, rawMsg)
 	case "delta":
 		handleDelta(c, h, db, rawMsg)
-	case "member_session_start":
-		handleSessionStart(c, h, rawMsg)
-	case "member_session_end":
-		handleSessionEnd(c, h, rawMsg)
 	}
 }
 
@@ -450,7 +399,7 @@ func handleSubscribe(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 		Rejected: rejected,
 	})
 	for _, cartID := range added {
-		sendJSON(c, buildStateMsg(db, h, cartID))
+		sendJSON(c, buildStateMsg(db, cartID))
 	}
 }
 
@@ -548,57 +497,11 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 		if err != nil {
 			return
 		}
-		h.BroadcastToCart(cartID, relayed, c.deviceID)
+		// Per member, not per device (ADR-098): the sender's own account hears nothing of its own op on
+		// another device. CloudKit carries a person's data between their devices; the relay carries a shared
+		// cart between members. It is the connection's user, not the op's actor, which may be the system sentinel.
+		h.BroadcastToCartExcludeUser(cartID, relayed, c.userID)
 	}
 
 	sendAck(c, cartID, op.ID, msg.Ts, "applied")
-}
-
-// handleSessionStart / handleSessionEnd read the cart from the MESSAGE — the
-// connection no longer names one — and relay a re-marshalled envelope rather
-// than the raw frame, so the cartID peers receive is the normalised one this
-// connection was verified against.
-func handleSessionStart(c *Client, h *Hub, rawMsg []byte) {
-	msg, cartID, ok := parseSessionMsg(c, h, rawMsg)
-	if !ok {
-		return
-	}
-	h.SetActiveShopping(cartID, c.userID, msg.StoreID)
-	relaySessionMsg(c, h, msg, cartID)
-}
-
-func handleSessionEnd(c *Client, h *Hub, rawMsg []byte) {
-	msg, cartID, ok := parseSessionMsg(c, h, rawMsg)
-	if !ok {
-		return
-	}
-	h.ClearActiveShopping(cartID, c.userID)
-	relaySessionMsg(c, h, msg, cartID)
-}
-
-// parseSessionMsg decodes a presence envelope and applies both guards: the
-// sender may only speak for themselves, and only about a cart this connection
-// subscribed to.
-func parseSessionMsg(c *Client, h *Hub, rawMsg []byte) (MemberSessionMsg, string, bool) {
-	var msg MemberSessionMsg
-	if err := json.Unmarshal(rawMsg, &msg); err != nil {
-		return msg, "", false
-	}
-	if msg.UserID != c.userID {
-		return msg, "", false // silently drop mismatched userID
-	}
-	cartID := strings.ToLower(msg.CartID)
-	if !h.IsSubscribed(c, cartID) {
-		return msg, "", false
-	}
-	return msg, cartID, true
-}
-
-func relaySessionMsg(c *Client, h *Hub, msg MemberSessionMsg, cartID string) {
-	msg.CartID = cartID
-	b, err := json.Marshal(msg)
-	if err != nil {
-		return
-	}
-	h.BroadcastToCart(cartID, b, c.deviceID)
 }

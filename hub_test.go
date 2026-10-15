@@ -55,10 +55,13 @@ func TestHandleDeltaRejectsMultiOp(t *testing.T) {
 	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
 		t.Fatalf("AddMember: %v", err)
 	}
+	if _, err := AddMember(db, "cart-a", "user-b"); err != nil {
+		t.Fatalf("AddMember user-b: %v", err)
+	}
 	hub := NewHub()
 
 	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
-	peer := joinHub(hub, newTestClient("user-a", "dev-2"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a")
 
 	raw, _ := json.Marshal(DeltaMsg{
 		Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: 1000,
@@ -93,10 +96,13 @@ func TestHandleDeltaSingleOpAppliesAndRelays(t *testing.T) {
 	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
 		t.Fatalf("AddMember: %v", err)
 	}
+	if _, err := AddMember(db, "cart-a", "user-b"); err != nil {
+		t.Fatalf("AddMember user-b: %v", err)
+	}
 	hub := NewHub()
 
 	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
-	peer := joinHub(hub, newTestClient("user-a", "dev-2"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a")
 
 	raw, _ := json.Marshal(DeltaMsg{
 		Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: 1000,
@@ -140,12 +146,18 @@ func TestMultiplexedDeltaStaysInItsCart(t *testing.T) {
 	if _, err := AddMember(db, "cart-b", "user-a"); err != nil {
 		t.Fatalf("AddMember b: %v", err)
 	}
+	if _, err := AddMember(db, "cart-a", "user-b"); err != nil {
+		t.Fatalf("AddMember user-b: %v", err)
+	}
+	if _, err := AddMember(db, "cart-b", "user-b"); err != nil {
+		t.Fatalf("AddMember user-b: %v", err)
+	}
 	hub := NewHub()
 
 	// One connection carrying both carts, one peer in each.
 	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a", "cart-b")
-	peerA := joinHub(hub, newTestClient("user-a", "dev-2"), "cart-a")
-	peerB := joinHub(hub, newTestClient("user-a", "dev-3"), "cart-b")
+	peerA := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a")
+	peerB := joinHub(hub, newTestClient("user-b", "dev-3"), "cart-b")
 
 	raw, _ := json.Marshal(DeltaMsg{
 		Type: "delta", CartID: "cart-b", DeviceID: "dev-1", Ts: 1000,
@@ -234,37 +246,37 @@ func TestUnsubscribeUserFromCartCutsOneCartOnly(t *testing.T) {
 	}
 }
 
-// A dropped connection ends presence in EVERY cart it was shopping — one
-// connection now carries several, and the member walks away from all of them at
-// once. Each session_end names its own cart.
-func TestUnregisterEndsSessionInEveryActiveCart(t *testing.T) {
+// R-594: shopping presence is gone, but a build in the field still sends it. The
+// frame must fall through handleMessage — no broadcast, no reply — and leave the
+// connection able to carry the next delta.
+func TestLegacyMemberSessionFrameIsIgnored(t *testing.T) {
+	db := testDB(t)
+	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
 	hub := NewHub()
 
-	leaver := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a", "cart-b")
-	watcher := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a", "cart-b")
+	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a")
 
-	hub.SetActiveShopping("cart-a", "user-a", "store-1")
-	hub.SetActiveShopping("cart-b", "user-a", "store-2")
-
-	hub.Unregister(leaver)
-
-	ended := map[string]bool{}
-	for len(watcher.send) > 0 {
-		var msg MemberSessionMsg
-		if err := json.Unmarshal(<-watcher.send, &msg); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if msg.Type == "member_session_end" && msg.UserID == "user-a" {
-			ended[msg.CartID] = true
-		}
+	for _, typ := range []string{"member_session_start", "member_session_end"} {
+		raw := []byte(`{"type":"` + typ + `","cartID":"cart-a","userID":"user-a","storeID":"store-1"}`)
+		handleMessage(sender, hub, db, raw)
 	}
-	for _, cartID := range []string{"cart-a", "cart-b"} {
-		if !ended[cartID] {
-			t.Errorf("no member_session_end relayed for %s", cartID)
-		}
-		if len(hub.GetActiveShopping(cartID)) != 0 {
-			t.Errorf("%s still lists the disconnected member as active", cartID)
-		}
+	if len(peer.send) != 0 {
+		t.Errorf("peer received %d frame(s) for a legacy member_session frame", len(peer.send))
+	}
+	if len(sender.send) != 0 {
+		t.Errorf("sender received %d frame(s) for a legacy member_session frame", len(sender.send))
+	}
+
+	raw, _ := json.Marshal(DeltaMsg{
+		Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: 1000,
+		Ops: []Op{{Op: "add", ID: "item-1", Fields: map[string]any{"title": "Milk"}}},
+	})
+	handleMessage(sender, hub, db, raw)
+	if status, ok := drainAck(sender); !ok || status != "applied" {
+		t.Errorf("delta after a legacy frame: status=%q ok=%v, want \"applied\"", status, ok)
 	}
 }
 
@@ -491,9 +503,12 @@ func TestDeltaPassesThroughUncheckKeysWithoutStoringThem(t *testing.T) {
 	if _, err := AddMember(db, "cart-a", "user-a"); err != nil {
 		t.Fatalf("AddMember: %v", err)
 	}
+	if _, err := AddMember(db, "cart-a", "user-b"); err != nil {
+		t.Fatalf("AddMember user-b: %v", err)
+	}
 	hub := NewHub()
 	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
-	peer := joinHub(hub, newTestClient("user-a", "dev-2"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a")
 
 	send := func(ts float64, op Op) {
 		raw, _ := json.Marshal(DeltaMsg{Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: ts, Ops: []Op{op}})
@@ -514,7 +529,7 @@ func TestDeltaPassesThroughUncheckKeysWithoutStoringThem(t *testing.T) {
 		}
 	}
 	state := func() []byte {
-		b, _ := json.Marshal(buildStateMsg(db, hub, "cart-a"))
+		b, _ := json.Marshal(buildStateMsg(db, "cart-a"))
 		// Positive control: an empty snapshot would pass an absence check vacuously.
 		if !bytes.Contains(b, []byte("Milk")) {
 			t.Fatalf("STATE snapshot does not carry the item, so its absence check proves nothing: %s", b)

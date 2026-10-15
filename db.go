@@ -920,7 +920,7 @@ func ApplyOp(
 	out := OpOutcome{Applied: won || v.tookEffect || w.advanced}
 	for k, val := range fields {
 		switch {
-		case k == wantKey:
+		case k == "lastWantedAt": // a member's latest want: neither content nor completion, decideWant's register
 			if !w.advanced {
 				continue
 			}
@@ -940,10 +940,6 @@ func ApplyOp(
 	return out, tx.Commit()
 }
 
-// wantKey is the wire key of a member's latest want. It is neither content nor completion: a fact with
-// its own register, decideWant's.
-const wantKey = "lastWantedAt"
-
 // wantVerdict is decideWant's ruling on one op.
 type wantVerdict struct {
 	next     sql.NullFloat64 // the register after the op
@@ -958,7 +954,7 @@ type wantVerdict struct {
 // instant would sit above every real want and refuse them all.
 func decideWant(fields map[string]any, stored sql.NullFloat64, now float64) wantVerdict {
 	v := wantVerdict{next: stored}
-	t, ok := fields[wantKey].(float64)
+	t, ok := fields["lastWantedAt"].(float64)
 	if !ok || t > now+actSkew || stored.Valid && t <= stored.Float64 {
 		return v
 	}
@@ -1093,6 +1089,14 @@ func ApplyLWW(
 	}
 
 	if op == "delete" {
+		// A delete of a row that exists and is already tombstoned changes nothing: refused, so peers are
+		// not told twice and deleted_at is not extended (ADR-098 §3).
+		var already int
+		if err := q.QueryRow(`SELECT deleted FROM items WHERE id=? AND cart_id=?`, itemID, cartID).Scan(&already); err == nil && already == 1 {
+			log.Printf("ApplyLWW: delete skipped on tombstoned item %s/%s", cartID, itemID)
+			return lwwRefused, nil
+		}
+
 		// Soft-delete: mark deleted + deleted_at. If row doesn't exist, insert a
 		// tombstone so stale add ops can't resurrect the item.
 		res, err := q.Exec(`

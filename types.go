@@ -11,25 +11,25 @@ import (
 // ---------------------------------------------------------------------------
 
 // Wire protocol version (TDD §3.3). Absent v/minV on the wire = 1 (pre-version
-// peers). Phase 1 is advisory only: the server stamps these on every state
-// message but never enforces; enforcement (phase 2) arrives only with a real
-// breaking change, by raising minClientVersion.
+// peers). The server stamps both on every state message and never checks a
+// client's v: a client below minV refuses the state, stops syncing and asks
+// its user to update. Raised to 2 on 1.8.21's release day (R-585), so a
+// pre-1.8.21 build stops syncing shared carts.
 const (
-	protocolVersion  = 1 // the protocol version this server speaks
-	minClientVersion = 1 // lowest client protocol version the server serves
+	protocolVersion  = 2 // the protocol version this server speaks
+	minClientVersion = 2 // lowest client protocol version the server serves
 )
 
 // StateMsg is sent by the server to the client immediately after WebSocket connect.
 type StateMsg struct {
-	Type                  string                `json:"type"` // "state"
-	V                     int                   `json:"v"`    // = protocolVersion
-	MinV                  int                   `json:"minV"` // = minClientVersion; a client below this refuses to sync
-	CartID                string                `json:"cartID"`
-	OwnerID               string                `json:"ownerID"`
-	Items                 []ItemRow             `json:"items"`
-	ActiveShoppingMembers []ActiveShoppingEntry `json:"activeShoppingMembers"`
-	Members               []MemberInfo          `json:"members"`
-	Tombstones            []TombstoneRow        `json:"tombstones"` // ADR-038: soft-deleted rows, so the client deletes on explicit tombstone rather than absence
+	Type       string         `json:"type"` // "state"
+	V          int            `json:"v"`    // = protocolVersion
+	MinV       int            `json:"minV"` // = minClientVersion; a client below this refuses to sync
+	CartID     string         `json:"cartID"`
+	OwnerID    string         `json:"ownerID"`
+	Items      []ItemRow      `json:"items"`
+	Members    []MemberInfo   `json:"members"`
+	Tombstones []TombstoneRow `json:"tombstones"` // ADR-038: soft-deleted rows, so the client deletes on explicit tombstone rather than absence
 }
 
 // AckMsg acknowledges a processed delta back to the originating connection only
@@ -84,12 +84,6 @@ type MemberInfo struct {
 	DisplayName string `json:"displayName"`
 	Color       string `json:"color"`
 	Tier        string `json:"tier"`
-}
-
-// ActiveShoppingEntry represents a member currently in ActiveShopping for a cart.
-type ActiveShoppingEntry struct {
-	UserID  string `json:"userID"`
-	StoreID string `json:"storeID"`
 }
 
 // ItemRow is the item representation used in state messages and REST responses.
@@ -198,17 +192,6 @@ type OwnerTransferredMsg struct {
 	CartID      string `json:"cartID"` // the cart whose owner changed
 	NewOwnerID  string `json:"newOwnerID"`
 	DisplayName string `json:"displayName"`
-}
-
-// MemberSessionMsg covers both member_session_start and member_session_end.
-// Differentiated by the "type" field. StoreID is omitted on session_end.
-// CartID travels in BOTH directions here: the client names the cart it is
-// shopping, and the relay names it again on the way out.
-type MemberSessionMsg struct {
-	Type    string `json:"type"` // "member_session_start" | "member_session_end"
-	CartID  string `json:"cartID"`
-	UserID  string `json:"userID"`
-	StoreID string `json:"storeID,omitempty"` // present on start, absent on end
 }
 
 // ---------------------------------------------------------------------------

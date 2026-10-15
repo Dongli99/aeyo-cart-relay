@@ -158,7 +158,7 @@ func (r *relayRig) events(spine string) string {
 // stateRow is the item as a reconnecting phone reads it: the STATE snapshot's bytes, decoded.
 func (r *relayRig) stateRow(id string) map[string]any {
 	r.t.Helper()
-	b, err := json.Marshal(buildStateMsg(r.db, r.hub, relayCart))
+	b, err := json.Marshal(buildStateMsg(r.db, relayCart))
 	if err != nil {
 		r.t.Fatalf("marshal state: %v", err)
 	}

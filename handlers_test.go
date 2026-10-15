@@ -538,7 +538,7 @@ func TestCreateRefusesAMalformedProposedID(t *testing.T) {
 // stateMembers builds a state message for a cart and returns its members.
 func stateMembers(t *testing.T, db *sql.DB, cartID string) []MemberInfo {
 	t.Helper()
-	return buildStateMsg(db, NewHub(), cartID).Members
+	return buildStateMsg(db, cartID).Members
 }
 
 // premiumCart gives cart-p a free owner (owner-p) and a free second member (peer-p).
