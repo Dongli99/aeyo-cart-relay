@@ -68,7 +68,6 @@ const (
 // hub's mutex is the one thing guarding it.
 type Client struct {
 	userID     string
-	deviceID   string
 	conn       *websocket.Conn
 	send       chan []byte
 	subscribed map[string]bool
@@ -216,15 +215,12 @@ func (h *Hub) Unregister(c *Client) {
 	h.mu.Unlock()
 }
 
-// BroadcastToCart sends msg to all clients subscribed to cartID except the one
-// with excludeDeviceID.
-func (h *Hub) BroadcastToCart(cartID string, msg []byte, excludeDeviceID string) {
+// BroadcastToCart sends msg to every client subscribed to cartID. A delta's fan-out is
+// BroadcastToCartExcludeUser's (ADR-098).
+func (h *Hub) BroadcastToCart(cartID string, msg []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for c := range h.cartIndex[cartID] {
-		if c.deviceID == excludeDeviceID {
-			continue
-		}
 		select {
 		case c.send <- msg:
 		default:
@@ -486,7 +482,8 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 	}
 
 	// Peers hear only what took effect (R-585): a refused re-assert would replay an old purchase on
-	// their phones, and stale content riding a late act would revert a newer edit. The relayed ts stays
+	// their phones, a repeated delete would tell them twice (ADR-098), and stale content riding a late
+	// act would revert a newer edit. The relayed ts stays
 	// the op's own. The actor injected is the system sentinel for system-attributed writes, else the
 	// connection's authenticated userID.
 	if out.Broadcast {
@@ -504,4 +501,15 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 	}
 
 	sendAck(c, cartID, op.ID, msg.Ts, "applied")
+
+	// A rescued older edit (ADR-096 §5): it won a key below the row clock, so every phone's per-item gate
+	// holds its delta. The cart's state carries the row's ts, which equals each member's item clock, and
+	// that passes the gate — so everyone, the sender included, applies the edit within one round trip.
+	if out.Rescued {
+		stateB, err := json.Marshal(buildStateMsg(db, cartID))
+		if err != nil {
+			return
+		}
+		h.BroadcastToCart(cartID, stateB)
+	}
 }

@@ -662,7 +662,7 @@ func tierOf(t *testing.T, s StateMsg, userID string) (string, bool) {
 func TestTransferBroadcastsStateSoTheNewOwnersTierArrives(t *testing.T) {
 	db, cartA, _, keyAliceA, _, _ := subTestDB(t)
 	hub := NewHub()
-	watcher := joinHub(hub, newTestClient("bob", "dev-1"), cartA)
+	watcher := joinHub(hub, newTestClient("bob"), cartA)
 
 	w := postJSON(t, transferHandler(db, hub), cartA, keyAliceA,
 		map[string]any{"cartID": cartA, "newOwnerID": "bob"})
@@ -695,7 +695,7 @@ func TestTransferBroadcastsStateSoTheNewOwnersTierArrives(t *testing.T) {
 func TestLeaveBroadcastsStateAfterTheOwnerHandsOffAndGoes(t *testing.T) {
 	db, cartA, _, keyAliceA, _, _ := subTestDB(t)
 	hub := NewHub()
-	watcher := joinHub(hub, newTestClient("bob", "dev-1"), cartA)
+	watcher := joinHub(hub, newTestClient("bob"), cartA)
 
 	w := postJSON(t, leaveCartHandler(db, hub), cartA, keyAliceA,
 		map[string]any{"cartID": cartA})

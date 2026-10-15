@@ -15,12 +15,12 @@ import (
 )
 
 // newTestClient builds a Client usable by handleDelta without a real WebSocket:
-// handleDelta only touches userID/deviceID, the subscription set, and the
-// buffered send channel (the conn is used solely by the read/write pumps).
-func newTestClient(userID, deviceID string) *Client {
+// handleDelta only touches userID, the subscription set, and the buffered send
+// channel (the conn is used solely by the read/write pumps). A device is its own
+// Client; the device ID a delta carries is the message's.
+func newTestClient(userID string) *Client {
 	return &Client{
 		userID:     userID,
-		deviceID:   deviceID,
 		send:       make(chan []byte, 16),
 		subscribed: make(map[string]bool),
 	}
@@ -60,8 +60,8 @@ func TestHandleDeltaRejectsMultiOp(t *testing.T) {
 	}
 	hub := NewHub()
 
-	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
-	peer := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a")
+	sender := joinHub(hub, newTestClient("user-a"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-b"), "cart-a")
 
 	raw, _ := json.Marshal(DeltaMsg{
 		Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: 1000,
@@ -101,8 +101,8 @@ func TestHandleDeltaSingleOpAppliesAndRelays(t *testing.T) {
 	}
 	hub := NewHub()
 
-	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
-	peer := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a")
+	sender := joinHub(hub, newTestClient("user-a"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-b"), "cart-a")
 
 	raw, _ := json.Marshal(DeltaMsg{
 		Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: 1000,
@@ -116,7 +116,7 @@ func TestHandleDeltaSingleOpAppliesAndRelays(t *testing.T) {
 	if status, ok := drainAck(sender); !ok || status != "applied" {
 		t.Errorf("sender ack: status=%q ok=%v, want \"applied\"", status, ok)
 	}
-	// Peer (different deviceID) must receive exactly the relayed delta.
+	// The peer, another member, must receive exactly the relayed delta.
 	select {
 	case b := <-peer.send:
 		var relayed DeltaMsg
@@ -155,9 +155,9 @@ func TestMultiplexedDeltaStaysInItsCart(t *testing.T) {
 	hub := NewHub()
 
 	// One connection carrying both carts, one peer in each.
-	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a", "cart-b")
-	peerA := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a")
-	peerB := joinHub(hub, newTestClient("user-b", "dev-3"), "cart-b")
+	sender := joinHub(hub, newTestClient("user-a"), "cart-a", "cart-b")
+	peerA := joinHub(hub, newTestClient("user-b"), "cart-a")
+	peerB := joinHub(hub, newTestClient("user-b"), "cart-b")
 
 	raw, _ := json.Marshal(DeltaMsg{
 		Type: "delta", CartID: "cart-b", DeviceID: "dev-1", Ts: 1000,
@@ -193,7 +193,7 @@ func TestDeltaForUnsubscribedCartIsRejected(t *testing.T) {
 	}
 	hub := NewHub()
 
-	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
+	sender := joinHub(hub, newTestClient("user-a"), "cart-a")
 
 	raw, _ := json.Marshal(DeltaMsg{
 		Type: "delta", CartID: "cart-b", DeviceID: "dev-1", Ts: 1000,
@@ -223,7 +223,7 @@ func TestUnsubscribeUserFromCartCutsOneCartOnly(t *testing.T) {
 	}
 	hub := NewHub()
 
-	c := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a", "cart-b")
+	c := joinHub(hub, newTestClient("user-a"), "cart-a", "cart-b")
 
 	if !hub.UnsubscribeUserFromCart("user-a", "cart-a") {
 		t.Fatalf("UnsubscribeUserFromCart reported no subscription to drop")
@@ -236,11 +236,11 @@ func TestUnsubscribeUserFromCartCutsOneCartOnly(t *testing.T) {
 	}
 
 	// The broadcast index must agree with the subscription set.
-	hub.BroadcastToCart("cart-a", []byte(`{"type":"noop"}`), "")
+	hub.BroadcastToCart("cart-a", []byte(`{"type":"noop"}`))
 	if len(c.send) != 0 {
 		t.Errorf("a revoked cart still reaches the connection through the broadcast index")
 	}
-	hub.BroadcastToCart("cart-b", []byte(`{"type":"noop"}`), "")
+	hub.BroadcastToCart("cart-b", []byte(`{"type":"noop"}`))
 	if len(c.send) != 1 {
 		t.Errorf("cart-b broadcast did not reach the connection (queued %d)", len(c.send))
 	}
@@ -256,8 +256,8 @@ func TestLegacyMemberSessionFrameIsIgnored(t *testing.T) {
 	}
 	hub := NewHub()
 
-	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
-	peer := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a")
+	sender := joinHub(hub, newTestClient("user-a"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-b"), "cart-a")
 
 	for _, typ := range []string{"member_session_start", "member_session_end"} {
 		raw := []byte(`{"type":"` + typ + `","cartID":"cart-a","userID":"user-a","storeID":"store-1"}`)
@@ -284,7 +284,7 @@ func TestLegacyMemberSessionFrameIsIgnored(t *testing.T) {
 // cart to an open connection does not re-deliver every other cart's state.
 func TestSubscribeReportsOnlyNewCarts(t *testing.T) {
 	hub := NewHub()
-	c := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
+	c := joinHub(hub, newTestClient("user-a"), "cart-a")
 
 	added := hub.Subscribe(c, []string{"cart-a", "cart-b"})
 	if len(added) != 1 || added[0] != "cart-b" {
@@ -299,7 +299,7 @@ func TestSubscribeReportsOnlyNewCarts(t *testing.T) {
 	if hub.IsSubscribed(c, "cart-a") {
 		t.Errorf("cart-a survived a replacing subscribe")
 	}
-	hub.BroadcastToCart("cart-a", []byte(`{"type":"noop"}`), "")
+	hub.BroadcastToCart("cart-a", []byte(`{"type":"noop"}`))
 	if len(c.send) != 0 {
 		t.Errorf("a dropped cart still reaches the connection through the broadcast index")
 	}
@@ -310,7 +310,7 @@ func TestSubscribeReportsOnlyNewCarts(t *testing.T) {
 // items mid-flush; the bucket now holds a burst far above that, and a message
 // past it waits rather than costing the connection.
 func TestMessageBudgetAbsorbsInitialShareBurst(t *testing.T) {
-	c := newTestClient("user-a", "dev-1")
+	c := newTestClient("user-a")
 	c.tokens = wsBurstMsgs
 	c.lastToken = time.Now()
 
@@ -507,8 +507,8 @@ func TestDeltaPassesThroughUncheckKeysWithoutStoringThem(t *testing.T) {
 		t.Fatalf("AddMember user-b: %v", err)
 	}
 	hub := NewHub()
-	sender := joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a")
-	peer := joinHub(hub, newTestClient("user-b", "dev-2"), "cart-a")
+	sender := joinHub(hub, newTestClient("user-a"), "cart-a")
+	peer := joinHub(hub, newTestClient("user-b"), "cart-a")
 
 	send := func(ts float64, op Op) {
 		raw, _ := json.Marshal(DeltaMsg{Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: ts, Ops: []Op{op}})

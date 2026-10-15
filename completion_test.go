@@ -39,7 +39,7 @@ type delivery struct {
 func newRelayRig(t *testing.T) *relayRig {
 	t.Helper()
 	r := &relayRig{t: t, db: testDB(t), hub: NewHub(), clients: map[string]*Client{}}
-	r.observer = joinHub(r.hub, newTestClient("user-c", "dev-c"), relayCart)
+	r.observer = joinHub(r.hub, newTestClient("user-c"), relayCart)
 	return r
 }
 
@@ -60,10 +60,10 @@ func (r *relayRig) send(user string, ts float64, op Op) delivery {
 	r.t.Helper()
 	c, ok := r.clients[user]
 	if !ok {
-		c = joinHub(r.hub, newTestClient(user, "dev-"+user), relayCart)
+		c = joinHub(r.hub, newTestClient(user), relayCart)
 		r.clients[user] = c
 	}
-	raw, _ := json.Marshal(DeltaMsg{Type: "delta", CartID: relayCart, DeviceID: c.deviceID, Ts: ts, Ops: []Op{op}})
+	raw, _ := json.Marshal(DeltaMsg{Type: "delta", CartID: relayCart, DeviceID: "dev-" + user, Ts: ts, Ops: []Op{op}})
 	handleDelta(c, r.hub, r.db, raw)
 
 	var d delivery
@@ -684,9 +684,10 @@ func TestQuietClearFollowsTheAct(t *testing.T) {
 		}
 	})
 
+	// The flag's own key must lose (ADR-096): a newer write to the flag, not merely to the item.
 	t.Run("an explicit flag that lost LWW does not hold off the clear", func(t *testing.T) {
 		r := seedQuiet(t)
-		r.send("user-a", 3000, update("sun", map[string]any{"title": "SPF 50"}))
+		r.send("user-a", 3000, update("sun", map[string]any{"quietUntilFirstPurchase": true}))
 		r.send("user-b", 2000, update("sun", map[string]any{
 			"checked": true, "purchasedAt": 2000.0, "quietUntilFirstPurchase": true}))
 		if quiet(r) {
@@ -880,12 +881,13 @@ func TestMixedBuildShapes(t *testing.T) {
 // Judgment calls, pinned
 // ---------------------------------------------------------------------------
 
-// J1: a peer is told exactly the keys that took effect. A mixed op that lost LWW relays only its
-// completion; one that won LWW with a refused completion relays only its content.
+// J1: a peer is told exactly the keys that took effect. A mixed op whose content key lost relays only its
+// completion; one whose content won with a refused completion relays only its content. Under ADR-096 a
+// key loses only to a newer write to that key, so the newer write here is to notes.
 func TestRelayCarriesOnlyWhatTookEffect(t *testing.T) {
 	r := newRelayRig(t)
 	r.seedChecked()
-	r.send("user-b", 3000, update("milk", map[string]any{"title": "Oat milk"}))
+	r.send("user-b", 3000, update("milk", map[string]any{"notes": "whole"}))
 	d := r.send("user-a", 2000, update("milk", map[string]any{
 		"notes": "2%", "checked": true, "purchasedAt": 2000.0, "purchaseUTCOffset": -14400.0}))
 	expectDelivery(t, d, "applied", "checked,purchaseUTCOffset,purchasedAt")

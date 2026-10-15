@@ -2,8 +2,10 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -48,6 +50,7 @@ const itemsTableBody = `
     quiet_until_first_purchase INTEGER DEFAULT 0,
     attributed_to TEXT,
     ts            REAL NOT NULL,
+    field_ts      TEXT,
     device_id     TEXT,
     deleted       INTEGER DEFAULT 0,
     deleted_at    REAL,
@@ -159,6 +162,9 @@ var itemFactColumns = []struct{ name, ddl string }{
 	// contract with deployed apps. Stored so a member who was offline when the flag was set still
 	// learns the item is quiet instead of predicting for it.
 	{"quiet_until_first_purchase", "ALTER TABLE items ADD COLUMN quiet_until_first_purchase INTEGER DEFAULT 0"},
+	// ADR-096: each content key's own LWW clock, a JSON map from wire key to ts plus a floor entry "*".
+	// NULL on a row written before it: that row's floor is its ts as it stands (readFieldClocks).
+	{"field_ts", "ALTER TABLE items ADD COLUMN field_ts TEXT"},
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +252,7 @@ func migrateItemsCompositeKey(db *sql.DB) error {
 		purchase_store_brand, purchase_cancelled,
 		category_hint_name, category_hint_icon, category_hint_color, store_hint_brand,
 		last_wanted_at, quiet_until_first_purchase,
-		attributed_to, ts, device_id, deleted, deleted_at`
+		attributed_to, ts, field_ts, device_id, deleted, deleted_at`
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -853,10 +859,11 @@ type OpOutcome struct {
 	Applied   bool           // some part of the op took effect: the sender's ack reads "applied", else "discarded"
 	Broadcast bool           // peers must hear of it
 	Fields    map[string]any // the op's keys that took effect — exactly what a broadcast relays
+	Rescued   bool           // an older edit won a key below the row clock: members need the cart's state (ADR-096 §5)
 }
 
 // ApplyOp applies one op in one transaction. The op splits by its keys (R-585): the CONTENT part follows
-// last-write-wins (ApplyLWW), and the COMPLETION part applies by act identity whatever LWW said
+// last-write-wins key by key (ApplyLWW, ADR-096), and the COMPLETION part applies by act identity whatever LWW said
 // (decideCompletion). A completion that loses LWW is still an act — an uncheck made offline before
 // somebody renamed the item is still that member's uncheck — but its stale content must not ride in on
 // it. The guards bind the whole op: an update to a missing or tombstoned row, and an add older than its
@@ -875,14 +882,13 @@ func ApplyOp(
 	defer tx.Rollback()
 
 	lww, err := ApplyLWW(tx, cartID, itemID, op, fields, ts, deviceID)
-	if err != nil || lww == lwwRefused {
+	if err != nil || lww.refused {
 		return OpOutcome{}, err
 	}
 	if op == "delete" {
 		return OpOutcome{Applied: true, Broadcast: true, Fields: fields}, tx.Commit()
 	}
 
-	won := lww == lwwWon
 	var row completionPair
 	var wanted sql.NullFloat64
 	var deleted bool
@@ -896,14 +902,13 @@ func ApplyOp(
 	var w wantVerdict
 	if !deleted { // an add that lost LWW to a stale tombstone left the row deleted: no act or want lands on it
 		now := float64(time.Now().Unix())
-		v = decideCompletion(op, fields, won, row, now, ts, userID)
+		v = decideCompletion(op, fields, lww, row, now, ts, userID)
 		w = decideWant(fields, wanted, now)
 	}
 	// The silence a member asked for ends on a check-off that advanced the act, or on a want that advanced
-	// the register — unless this op won LWW and sets the flag itself, which is then authoritative. A losing
-	// op's flag is stale content, but its act or want still ends the silence.
-	_, explicitQuiet := fields["quietUntilFirstPurchase"]
-	clearQuiet := v.clearQuiet || w.advanced && !(won && explicitQuiet)
+	// the register — unless this op sets the flag itself and its key won, which is then authoritative. A
+	// flag whose key lost is stale content, but its act or want still ends the silence.
+	clearQuiet := v.clearQuiet || w.advanced && !lww.won["quietUntilFirstPurchase"]
 	if v.next != row || w.advanced || clearQuiet {
 		if _, err := tx.Exec(`
 			UPDATE items SET checked=?, purchased_at=?, attributed_to=?, purchase_store_brand=?, purchase_cancelled=?,
@@ -917,7 +922,9 @@ func ApplyOp(
 	}
 	captureConsumption(tx, cartID, itemID, v.capture)
 
-	out := OpOutcome{Applied: won || v.tookEffect || w.advanced}
+	// Applied: a key won, the row clock rose, the act took effect, or the want advanced. Discarded therefore
+	// means every content key had a newer write, or a guard refused the op.
+	out := OpOutcome{Applied: len(lww.won) > 0 || lww.rose || v.tookEffect || w.advanced, Rescued: lww.rescued}
 	for k, val := range fields {
 		switch {
 		case k == "lastWantedAt": // a member's latest want: neither content nor completion, decideWant's register
@@ -928,7 +935,7 @@ func ApplyOp(
 			if !v.tookEffect {
 				continue
 			}
-		case !won:
+		case !lww.won[k]:
 			continue
 		}
 		if out.Fields == nil {
@@ -985,7 +992,7 @@ type completionVerdict struct {
 // decideCompletion is the one owner of an op's completion part (R-585): the row's new pair, its cancel
 // bit, the reservoir move, and whether peers hear of it. Op shapes are read by their KEYS, never by
 // which build sent them — the relay cannot tell an old client's snapshot from a new client's op, so a
-// shape decides. `row` is the item's completion state before the op; `won` is LWW's verdict on its
+// shape decides. `row` is the item's completion state before the op; `lww` is LWW's verdict on its
 // content; `rawTs` is the op's own ts, unclamped.
 //
 //   - A check-off with a valid act t advances the pair only to a later act (row P null, or t > P), and
@@ -993,15 +1000,15 @@ type completionVerdict struct {
 //   - An uncheck's author verdict is followed, never recomputed. cancels:true retracts t by identity
 //     whatever the pair did, lowers the pair only if t is the act it holds, and advances it if t is
 //     later (the uncheck reached the relay before its own check-off). cancels:false keeps everything.
-//   - An uncheck with no verdict (a client that predates it) stays under LWW: it lowers the pair only
-//     when it won, the row is checked, and it names the row's act or nothing.
+//   - An uncheck with no verdict (a client that predates it) stays under the ROW clock: it lowers the pair
+//     only when its ts beat the row's, the row is checked, and it names the row's act or nothing.
 //   - An add's checked:false asserts nothing: an add is a birth snapshot, not an act.
 //
 // A valid act is a numeric purchasedAt no later than now + actSkew. No act ever comes from ts.
 func decideCompletion(
 	op string,
 	fields map[string]any,
-	won bool,
+	lww lwwVerdict,
 	row completionPair,
 	now, rawTs float64,
 	userID string,
@@ -1027,10 +1034,9 @@ func decideCompletion(
 			brand:       sql.NullString{String: brand, Valid: hasBrand}, // a new act never inherits the last one's shop
 		}
 		v.capture = reservoirMove{reservoirRecord, t}
-		// An explicit flag in this op wins over the derived clear, but only if it applied: a losing op's
-		// flag is stale content, and its act still ends the silence.
-		_, explicitQuiet := fields["quietUntilFirstPurchase"]
-		v.clearQuiet = !(won && explicitQuiet)
+		// An explicit flag in this op wins over the derived clear, but only if its key won: a losing flag
+		// is stale content, and its act still ends the silence.
+		v.clearQuiet = !lww.won["quietUntilFirstPurchase"]
 		v.tookEffect = true
 		return v
 	}
@@ -1055,7 +1061,7 @@ func decideCompletion(
 	}
 	// No verdict: bare, naming an act without one, or cancels with no act to name.
 	namesRowAct := !named || p.Valid && t == p.Float64
-	if !won || !row.checked || !namesRowAct {
+	if !lww.rowWon || !row.checked || !namesRowAct {
 		return v
 	}
 	v.next = completionPair{purchasedAt: p, brand: row.brand}
@@ -1064,24 +1070,75 @@ func decideCompletion(
 	return v
 }
 
-// lwwOutcome is LWW's verdict on an op's content part.
-type lwwOutcome int
+// lwwVerdict is ApplyLWW's ruling on an op's content part (ADR-096).
+type lwwVerdict struct {
+	refused bool            // a guard refused the whole op: an update to a missing or tombstoned row, an add older than its tombstone
+	won     map[string]bool // the content keys that applied: exactly what of the content part peers may hear
+	rowWon  bool            // the op's ts beat the row clock as it stood before the op — the pre-ADR-096 verdict
+	rose    bool            // the row clock rose: ts and device_id moved
+	rescued bool            // a key won while the op's ts sat below the row clock: phones' per-item gates would hold it
+}
 
-const (
-	lwwRefused lwwOutcome = iota // a guard refused the whole op: an update to a missing or tombstoned row, an add older than its tombstone
-	lwwLost                      // the row's content is newer: nothing of the content part applied
-	lwwWon                       // the content part applied, and ts and device_id moved
-)
+// isContentKey reports whether a wire key belongs to an op's content part: everything but its completion
+// (decideCompletion's) and its want (decideWant's).
+func isContentKey(k string) bool { return !completionKeys[k] && k != "lastWantedAt" }
 
-// ApplyLWW applies an op's CONTENT part using last-write-wins conflict resolution (TDD §4.5), and the
-// guards that bind the whole op. It never writes a completion column: those are decideCompletion's.
+// isSnapshot reports the whole-item snapshot shape: an update carrying checked, title and quantity together.
+// Builds before R-587 send it for every edit, and the state door's push-back sends it with an act. It keeps
+// the row rule — judged key by key, a stale snapshot would write stale values into keys older than its ts.
+func isSnapshot(op string, fields map[string]any) bool {
+	_, c := fields["checked"]
+	_, t := fields["title"]
+	_, q := fields["quantity"]
+	return op == "update" && c && t && q
+}
+
+// fieldFloor is the field_ts entry every key absent from the map reads.
+const fieldFloor = "*"
+
+// readFieldClocks decodes a row's field_ts. A row with no map — written before ADR-096 — takes its ts as it
+// stands as its floor, and its first write stores that floor before the row clock rises. Never the row's
+// CURRENT ts: that rises with every write, and an untouched key would then lose to the key next to it.
+func readFieldClocks(raw sql.NullString, rowTs float64) map[string]float64 {
+	clocks := map[string]float64{}
+	if raw.Valid {
+		if err := json.Unmarshal([]byte(raw.String), &clocks); err != nil {
+			log.Printf("readFieldClocks: malformed field_ts %q: %v — reading the row ts as the floor", raw.String, err)
+			clocks = map[string]float64{}
+		}
+	}
+	if _, ok := clocks[fieldFloor]; !ok {
+		clocks[fieldFloor] = rowTs
+	}
+	return clocks
+}
+
+func clockOf(clocks map[string]float64, k string) float64 {
+	if c, ok := clocks[k]; ok {
+		return c
+	}
+	return clocks[fieldFloor]
+}
+
+func encodeFieldClocks(clocks map[string]float64) string {
+	b, _ := json.Marshal(clocks) // a map of string to float64 always encodes
+	return string(b)
+}
+
+// ApplyLWW applies an op's CONTENT part by last-write-wins (TDD §4.5, ADR-096), and the guards that bind the
+// whole op. It never writes a completion column: those are decideCompletion's.
+//
+// Content is decided key by key: each key applies only if the op's ts beats that key's own clock, and a tie
+// keeps the stored value. Two shapes keep the row rule — an add, and the whole-item snapshot (isSnapshot) —
+// and apply all of their content only when their ts beats the row clock. The row clock never goes down.
 func ApplyLWW(
 	q querier,
 	cartID, itemID, op string,
 	fields map[string]any,
 	ts float64,
 	deviceID string,
-) (lwwOutcome, error) {
+) (lwwVerdict, error) {
+	refused := lwwVerdict{refused: true}
 	// Clamp ts: prevent far-future clients from permanently winning all conflicts.
 	effectiveTs := ts
 	if maxTs := float64(time.Now().Unix()) + 60; ts > maxTs {
@@ -1094,7 +1151,7 @@ func ApplyLWW(
 		var already int
 		if err := q.QueryRow(`SELECT deleted FROM items WHERE id=? AND cart_id=?`, itemID, cartID).Scan(&already); err == nil && already == 1 {
 			log.Printf("ApplyLWW: delete skipped on tombstoned item %s/%s", cartID, itemID)
-			return lwwRefused, nil
+			return refused, nil
 		}
 
 		// Soft-delete: mark deleted + deleted_at. If row doesn't exist, insert a
@@ -1103,7 +1160,7 @@ func ApplyLWW(
 			UPDATE items SET deleted=1, deleted_at=? WHERE id=? AND cart_id=?
 		`, effectiveTs, itemID, cartID)
 		if err != nil {
-			return lwwRefused, err
+			return refused, err
 		}
 		n, _ := res.RowsAffected()
 		if n == 0 {
@@ -1113,10 +1170,10 @@ func ApplyLWW(
 				VALUES (?, ?, ?, ?, 1, ?)
 			`, itemID, cartID, effectiveTs, deviceID, effectiveTs)
 			if err != nil {
-				return lwwRefused, err
+				return refused, err
 			}
 		}
-		return lwwWon, nil
+		return lwwVerdict{rowWon: true}, nil
 	}
 
 	// op == "add" or "update"
@@ -1125,6 +1182,7 @@ func ApplyLWW(
 		deviceID  string
 		deleted   int
 		deletedAt sql.NullFloat64
+		fieldTs   sql.NullString
 	}
 
 	// Item identity is (cart_id, id) — an unscoped id lookup here once matched
@@ -1132,9 +1190,9 @@ func ApplyLWW(
 	// instead of inserting into this one (the 2026-07-10 re-share incident).
 	var existing existingRow
 	err := q.QueryRow(`
-		SELECT ts, COALESCE(device_id,''), deleted, deleted_at
+		SELECT ts, COALESCE(device_id,''), deleted, deleted_at, field_ts
 		FROM items WHERE id=? AND cart_id=?
-	`, itemID, cartID).Scan(&existing.ts, &existing.deviceID, &existing.deleted, &existing.deletedAt)
+	`, itemID, cartID).Scan(&existing.ts, &existing.deviceID, &existing.deleted, &existing.deletedAt, &existing.fieldTs)
 
 	if err == sql.ErrNoRows {
 		// No existing row: only an add may create one. An update carries only the
@@ -1146,20 +1204,20 @@ func ApplyLWW(
 		// Discarding leaves the row absent so that repair can still see it.
 		if op == "update" {
 			log.Printf("ApplyLWW: update skipped on missing item %s/%s — only an add creates", cartID, itemID)
-			return lwwRefused, nil
+			return refused, nil
 		}
 		if err := insertItem(q, cartID, itemID, fields, effectiveTs, deviceID); err != nil {
-			return lwwRefused, err
+			return refused, err
 		}
-		return lwwWon, nil
+		return lwwVerdict{won: contentKeysOf(fields), rowWon: true, rose: true}, nil
 	}
 	if err != nil {
-		return lwwRefused, err
+		return refused, err
 	}
 
 	// Tombstone exists — check if deletion wins.
 	if existing.deleted == 1 && existing.deletedAt.Valid && existing.deletedAt.Float64 > effectiveTs {
-		return lwwRefused, nil // deletion wins; discard this write
+		return refused, nil // deletion wins; discard this write
 	}
 
 	// An update must never resurrect a tombstoned row (ADR-039): partial-field
@@ -1169,17 +1227,88 @@ func ApplyLWW(
 	// below, since the row already exists here). Skip and log.
 	if existing.deleted == 1 && op == "update" {
 		log.Printf("ApplyLWW: update skipped on tombstoned item %s/%s — no resurrect", cartID, itemID)
-		return lwwRefused, nil
+		return refused, nil
 	}
 
-	// Live row or stale tombstone being re-added — check LWW.
-	if effectiveTs > existing.ts || effectiveTs == existing.ts && deviceID < existing.deviceID {
-		if err := updateItem(q, cartID, itemID, op, fields, effectiveTs, deviceID); err != nil {
-			return lwwRefused, err
-		}
-		return lwwWon, nil
+	// Live row or stale tombstone being re-added.
+	v := lwwVerdict{
+		won:    map[string]bool{},
+		rowWon: effectiveTs > existing.ts || effectiveTs == existing.ts && deviceID < existing.deviceID,
+		rose:   effectiveTs > existing.ts,
 	}
-	return lwwLost, nil
+	rebirth := op == "add" && v.rowWon // a re-add over a stale tombstone, or over a live row it beat
+	clocks := readFieldClocks(existing.fieldTs, existing.ts)
+	var lost []string
+	switch {
+	case op == "add" || isSnapshot(op, fields):
+		if v.rowWon {
+			v.won = contentKeysOf(fields)
+		}
+	default:
+		for k := range fields {
+			if isContentKey(k) && effectiveTs > clockOf(clocks, k) {
+				v.won[k] = true
+			}
+		}
+		v.rescued = len(v.won) > 0 && effectiveTs < existing.ts
+	}
+	for k := range fields {
+		if !isContentKey(k) {
+			continue
+		}
+		if v.won[k] {
+			clocks[k] = effectiveTs
+		} else if clockOf(clocks, k) != effectiveTs { // a tie is a replay, which does nothing: not a loss
+			lost = append(lost, k)
+		}
+	}
+	if rebirth {
+		clocks = map[string]float64{fieldFloor: effectiveTs} // a birth stamps the floor, not its keys
+	}
+	if len(lost) > 0 || v.rescued {
+		sort.Strings(lost)
+		log.Printf("ApplyLWW: %s/%s content keys lost %v rescued %v", cartID, itemID, lost, sortedKeys(v.won, v.rescued))
+	}
+
+	if len(v.won) == 0 && !v.rose && !rebirth {
+		return v, nil
+	}
+	rowTs, rowDevice := existing.ts, existing.deviceID
+	if v.rose {
+		rowTs, rowDevice = effectiveTs, deviceID
+	}
+	content := map[string]any{}
+	for k := range v.won {
+		content[k] = fields[k]
+	}
+	if err := updateItem(q, cartID, itemID, rebirth, content, rowTs, rowDevice, encodeFieldClocks(clocks)); err != nil {
+		return refused, err
+	}
+	return v, nil
+}
+
+// contentKeysOf is the set of an op's content keys.
+func contentKeysOf(fields map[string]any) map[string]bool {
+	out := map[string]bool{}
+	for k := range fields {
+		if isContentKey(k) {
+			out[k] = true
+		}
+	}
+	return out
+}
+
+// sortedKeys lists a rescue's winning keys for the log line, or nothing when the op rescued none.
+func sortedKeys(set map[string]bool, rescued bool) []string {
+	if !rescued {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // insertItem creates a row from an add's content part. Its completion columns start empty — an
@@ -1273,14 +1402,14 @@ func insertItem(
 		     global_id, frequency_days, is_active, paused_at, pause_reason, deferred_guess_date,
 		     deferred_guess_authored_at, category_hint_name, category_hint_icon,
 		     category_hint_color, store_hint_brand, quiet_until_first_purchase,
-		     ts, device_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		     ts, field_ts, device_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, itemID, cartID, title, quantity,
 		notes, specification, urgencyLevel,
 		globalID, frequencyDays, boolToInt(isActive), pausedAt, pauseReason, deferredGuessDate,
 		deferredGuessAuthoredAt, categoryHintName, categoryHintIcon,
 		categoryHintColor, storeHintBrand, boolToInt(quietUntilFirstPurchase),
-		ts, deviceID)
+		ts, encodeFieldClocks(map[string]float64{fieldFloor: ts}), deviceID)
 	return err
 }
 
@@ -1322,25 +1451,26 @@ func coerceNumericOrNull(field string, v any) (any, bool) {
 	return int(f), true
 }
 
-// updateItem writes an op's content part over a row it won LWW against. Completion keys are
-// decideCompletion's and are never read here — so a rename never moves the completer, and an old
-// client's whole-row snapshot cannot write its stale checked state.
+// updateItem writes the content keys an op won, with the row's clock, its device and its key clocks as
+// ApplyLWW ruled them. `fields` holds only winning content keys: completion keys are decideCompletion's
+// and never reach here — so a rename never moves the completer, and an old client's whole-row snapshot
+// cannot write its stale checked state.
 func updateItem(
 	q querier,
-	cartID, itemID, op string,
+	cartID, itemID string,
+	rebirth bool,
 	fields map[string]any,
 	ts float64,
-	deviceID string,
+	deviceID, fieldTs string,
 ) error {
 	// Build SET clause from fields that are present.
-	// ts and device_id move on every op that wins LWW, whichever parts of it applied.
-	setClauses := "ts=?, device_id=?"
-	args := []any{ts, deviceID}
+	setClauses := "ts=?, device_id=?, field_ts=?"
+	args := []any{ts, deviceID, fieldTs}
 
-	// Only a deliberate re-add (op=="add") may clear a tombstone; an update must
-	// never resurrect (ADR-039). ApplyLWW already blocks update-over-tombstone,
+	// Only a deliberate re-add may clear a tombstone; an update must never
+	// resurrect (ADR-039). ApplyLWW already blocks update-over-tombstone,
 	// so this both effects the intended add-resurrect and is defense in depth.
-	if op == "add" {
+	if rebirth {
 		setClauses += ", deleted=0, deleted_at=NULL"
 	}
 

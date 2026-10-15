@@ -291,7 +291,7 @@ func joinCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		// The joiner is not yet connected over WS (they open it after this HTTP call),
 		// so this only reaches already-connected members.
 		stateB, _ := json.Marshal(buildStateMsg(db, body.CartID))
-		hub.BroadcastToCart(body.CartID, stateB, "")
+		hub.BroadcastToCart(body.CartID, stateB)
 
 		members, _ := GetMembers(db, body.CartID)
 		items, _ := GetItems(db, body.CartID)
@@ -375,7 +375,7 @@ func leaveCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 					DisplayName: displayName,
 				}
 				b, _ := json.Marshal(msg)
-				hub.BroadcastToCart(body.CartID, b, "")
+				hub.BroadcastToCart(body.CartID, b)
 				transferred = true
 			}
 		}
@@ -405,7 +405,7 @@ func leaveCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		// earlier would re-assert the member this call is removing.
 		if transferred {
 			stateB, _ := json.Marshal(buildStateMsg(db, body.CartID))
-			hub.BroadcastToCart(body.CartID, stateB, "")
+			hub.BroadcastToCart(body.CartID, stateB)
 		}
 
 		count, _ := GetMemberCount(db, body.CartID)
@@ -459,7 +459,7 @@ func revokeHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		// before the unsubscribe below, which is what stops the target hearing it.
 		removedMsg := MemberRemovedMsg{Type: "member_removed", CartID: body.CartID, UserID: body.TargetUserID}
 		removedB, _ := json.Marshal(removedMsg)
-		hub.BroadcastToCart(body.CartID, removedB, "")
+		hub.BroadcastToCart(body.CartID, removedB)
 
 		// Broadcast secret_rotated to remaining members only (exclude target).
 		rotatedMsg := SecretRotatedMsg{Type: "secret_rotated", CartID: body.CartID, Secret: newSecret}
@@ -531,7 +531,7 @@ func inviteHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		// members (no exclude) get the new value to keep their cache authoritative.
 		rotatedMsg := SecretRotatedMsg{Type: "secret_rotated", CartID: cartID, Secret: newSecret}
 		rotatedB, _ := json.Marshal(rotatedMsg)
-		hub.BroadcastToCart(cartID, rotatedB, "")
+		hub.BroadcastToCart(cartID, rotatedB)
 
 		writeJSON(w, http.StatusOK, map[string]any{"secret": newSecret})
 	}
@@ -581,14 +581,14 @@ func transferHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 			DisplayName: displayName,
 		}
 		b, _ := json.Marshal(msg)
-		hub.BroadcastToCart(body.CartID, b, "")
+		hub.BroadcastToCart(body.CartID, b)
 
 		// A tier is reported for the owner and nobody else, so an ownership change IS a
 		// tier change. owner_transferred carries no members, so without this the new owner
 		// keeps the empty tier they held as an ordinary member until some other write
 		// happens to produce a state message.
 		stateB, _ := json.Marshal(buildStateMsg(db, body.CartID))
-		hub.BroadcastToCart(body.CartID, stateB, "")
+		hub.BroadcastToCart(body.CartID, stateB)
 
 		writeJSON(w, http.StatusOK, map[string]any{})
 	}
@@ -781,7 +781,6 @@ func wsHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 
 		client := &Client{
 			userID:     userID,
-			deviceID:   r.Header.Get("X-Device-ID"),
 			conn:       conn,
 			send:       make(chan []byte, 256),
 			subscribed: make(map[string]bool),

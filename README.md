@@ -184,7 +184,12 @@ ratelimit.go   per-IP token bucket on the unauthenticated entry points
 Tests sit beside the files they cover (`db_test.go`, `handlers_test.go`, `hub_test.go`, `ratelimit_test.go`).
 The merge semantics in `db.go` are the interesting part: concurrent edits from several
 phones, resolved last-write-wins per field, with rules about what may and may not resurrect
-a deleted row.
+a deleted row. Each field of an item's content keeps its own clock, so an older edit to one
+field still lands after a newer edit to a different one. Two shapes are decided for the whole
+row instead: an add, and an update carrying `checked`, `title` and `quantity` together (a
+whole-item snapshot, which judged field by field would write its stale values into older
+fields). A check-off, an uncheck and "still wanted" follow their own rules, not
+last-write-wins.
 
 **Comments reference internal documents** — `ADR-039`, `TDD §3.3`, and similar. Those are
 Aeyo's decision records and are not published. They are left in place because this is a

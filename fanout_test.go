@@ -27,9 +27,9 @@ func newFanoutRig(t *testing.T) fanoutRig {
 	hub := NewHub()
 	return fanoutRig{
 		db: db, hub: hub,
-		sender:  joinHub(hub, newTestClient("user-a", "dev-1"), "cart-a"),
-		sibling: joinHub(hub, newTestClient("user-a", "dev-2"), "cart-a"),
-		other:   joinHub(hub, newTestClient("user-b", "dev-3"), "cart-a"),
+		sender:  joinHub(hub, newTestClient("user-a"), "cart-a"),
+		sibling: joinHub(hub, newTestClient("user-a"), "cart-a"),
+		other:   joinHub(hub, newTestClient("user-b"), "cart-a"),
 	}
 }
 
