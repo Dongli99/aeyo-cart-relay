@@ -290,17 +290,18 @@ func joinCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		// Notify existing connected members of the new joiner via a full state snapshot.
 		// The joiner is not yet connected over WS (they open it after this HTTP call),
 		// so this only reaches already-connected members.
-		stateB, _ := json.Marshal(buildStateMsg(db, body.CartID))
+		// The response is built from the same snapshot (ADR-101 §9), so a joiner and a state cannot differ
+		// in what a row carries.
+		state := buildStateMsg(db, body.CartID)
+		stateB, _ := json.Marshal(state)
 		hub.BroadcastToCart(body.CartID, stateB)
 
-		members, _ := GetMembers(db, body.CartID)
-		items, _ := GetItems(db, body.CartID)
-
 		writeJSON(w, http.StatusOK, map[string]any{
-			"cartID":  body.CartID,
-			"subKey":  subKey,
-			"members": members,
-			"items":   items,
+			"cartID":     body.CartID,
+			"subKey":     subKey,
+			"members":    state.Members,
+			"items":      state.Items,
+			"tombstones": state.Tombstones,
 		})
 	}
 }
@@ -380,7 +381,8 @@ func leaveCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 			}
 		}
 
-		if err := RemoveMember(db, body.CartID, leaverID); err != nil {
+		finalList, err := RemoveMember(db, body.CartID, leaverID)
+		if err != nil {
 			log.Printf("leaveCart: RemoveMember: %v", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -415,7 +417,12 @@ func leaveCartHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 			}
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{})
+		// The leaver's final list (ADR-101 §4). Its other devices read the same list at their next
+		// subscription, since the leaver hears no member_removed.
+		if finalList == nil {
+			finalList = []ItemRow{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"finalList": finalList})
 	}
 }
 
@@ -442,7 +449,8 @@ func revokeHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 			return
 		}
 
-		if err := RemoveMember(db, body.CartID, body.TargetUserID); err != nil {
+		finalList, err := RemoveMember(db, body.CartID, body.TargetUserID)
+		if err != nil {
 			log.Printf("revoke: RemoveMember: %v", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -455,11 +463,17 @@ func revokeHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 			return
 		}
 
-		// Broadcast member_removed to ALL connected members (including target) —
-		// before the unsubscribe below, which is what stops the target hearing it.
+		// member_removed goes to ALL connected members, the target included — before the unsubscribe
+		// below, which is what stops the target hearing it. The target's copy carries its final list
+		// (ADR-101 §4); every other copy carries none.
 		removedMsg := MemberRemovedMsg{Type: "member_removed", CartID: body.CartID, UserID: body.TargetUserID}
 		removedB, _ := json.Marshal(removedMsg)
-		hub.BroadcastToCart(body.CartID, removedB)
+		hub.BroadcastToCartExcludeUser(body.CartID, removedB, body.TargetUserID)
+		if finalList != nil {
+			removedMsg.FinalList = &finalList
+		}
+		targetB, _ := json.Marshal(removedMsg)
+		hub.BroadcastToCartUser(body.CartID, targetB, body.TargetUserID)
 
 		// Broadcast secret_rotated to remaining members only (exclude target).
 		rotatedMsg := SecretRotatedMsg{Type: "secret_rotated", CartID: body.CartID, Secret: newSecret}
@@ -641,8 +655,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 func buildStateMsg(db *sql.DB, cartID string) StateMsg {
 	ownerID, _ := GetOwner(db, cartID)
 	members, _ := GetMembers(db, cartID)
-	items, _ := GetItems(db, cartID)
-	tombstones, _ := GetTombstones(db, cartID)
+	items, tombstones, _ := GetCartRows(db, cartID)
 
 	if items == nil {
 		items = []ItemRow{}
@@ -718,7 +731,14 @@ func verifySubscription(db *sql.DB, req []SubscribeCart, expectUserID string) (u
 			continue
 		}
 		if !ok {
-			rejected = append(rejected, SubscribeReject{CartID: wantCart, Reason: rejectUnknownKey})
+			// An ended key reads its final list, and nothing else (ADR-101 §4).
+			reject := SubscribeReject{CartID: wantCart, Reason: rejectUnknownKey}
+			if list, err := FinalList(db, want.SubKey, wantCart); err != nil {
+				log.Printf("verifySubscription: FinalList: %v", err)
+			} else if list != nil {
+				reject.FinalList = &list
+			}
+			rejected = append(rejected, reject)
 			continue
 		}
 		if !strings.EqualFold(cartID, wantCart) {
@@ -787,7 +807,7 @@ func wsHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		}
 
 		hub.Register(client)
-		hub.Subscribe(client, accepted)
+		hub.Subscribe(client, accepted, sub.V)
 
 		sendJSON(client, SubscribeResultMsg{
 			Type:     "subscribe_result",
@@ -906,7 +926,7 @@ func historyReadHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		globalID := r.URL.Query().Get("globalID")
+		globalID := strings.ToUpper(r.URL.Query().Get("globalID")) // one case for every id (ADR-101 §5)
 		if globalID == "" {
 			writeError(w, http.StatusBadRequest, "missing globalID")
 			return
@@ -946,7 +966,8 @@ func historyBackfillHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		if err := BackfillConsumptionEvents(db, cartID, body.GlobalID, body.Events); err != nil {
+		// One case for every id the relay keys a row by (ADR-101 §5).
+		if err := BackfillConsumptionEvents(db, cartID, strings.ToUpper(body.GlobalID), body.Events); err != nil {
 			log.Printf("historyBackfillHandler: %v", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return

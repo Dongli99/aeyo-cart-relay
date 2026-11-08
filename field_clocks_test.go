@@ -14,7 +14,8 @@ import (
 // apply runs one op the way handleDelta does and returns what the relay ruled, Rescued included.
 func (r *relayRig) apply(device string, ts float64, op Op) OpOutcome {
 	r.t.Helper()
-	out, err := ApplyOp(r.db, relayCart, op.ID, op.Op, op.Fields, ts, device, "user-"+device)
+	op.uppercaseIDs() // as handleDelta does at receipt (ADR-101 §5)
+	out, err := ApplyOp(r.db, relayCart, op, ts, device, "user-"+device)
 	if err != nil {
 		r.t.Fatalf("ApplyOp: %v", err)
 	}
@@ -25,7 +26,7 @@ func (r *relayRig) apply(device string, ts float64, op Op) OpOutcome {
 func (r *relayRig) col(id, column string) string {
 	r.t.Helper()
 	var v sql.NullString
-	if err := r.db.QueryRow(`SELECT CAST(`+column+` AS TEXT) FROM items WHERE cart_id=? AND id=?`, relayCart, id).
+	if err := r.db.QueryRow(`SELECT CAST(`+column+` AS TEXT) FROM items WHERE cart_id=? AND id=?`, relayCart, strings.ToUpper(id)).
 		Scan(&v); err != nil {
 		r.t.Fatalf("read %s: %v", column, err)
 	}

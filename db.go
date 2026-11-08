@@ -54,6 +54,10 @@ const itemsTableBody = `
     device_id     TEXT,
     deleted       INTEGER DEFAULT 0,
     deleted_at    REAL,
+    marker        TEXT,
+    echo          TEXT,
+    added_by      TEXT,
+    deleted_by    TEXT,
     PRIMARY KEY (cart_id, id),
     FOREIGN KEY (cart_id) REFERENCES rooms(cart_id) ON DELETE CASCADE
 `
@@ -112,6 +116,18 @@ CREATE TABLE IF NOT EXISTS consumption_events (
     FOREIGN KEY (cart_id) REFERENCES rooms(cart_id) ON DELETE CASCADE
 );
 
+-- An ended membership's final list (ADR-101 §4): the cart's live rows as they stood when the account's
+-- membership ended by a revoke or a leave, kept 30 days and handed only to that account. Keyed by the
+-- subscription key the membership held, which is what a removed device still presents. Deliberately no
+-- foreign key to rooms: the last member's leave deletes the room, and the list must outlive it.
+CREATE TABLE IF NOT EXISTS ended_memberships (
+    sub_key  TEXT PRIMARY KEY,
+    cart_id  TEXT NOT NULL,
+    user_id  TEXT NOT NULL,
+    ended_at REAL NOT NULL,
+    rows     TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_members_cart_id ON members(cart_id);
 -- UNIQUE, not merely an index: sub_key is looked up on its own to resolve a
 -- connection's (cart, user), so a collision would resolve one member's key to
@@ -120,6 +136,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_members_sub_key ON members(sub_key);
 CREATE INDEX IF NOT EXISTS idx_items_cart_id   ON items(cart_id);
 CREATE INDEX IF NOT EXISTS idx_items_tombstone ON items(deleted, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_consumption_concept ON consumption_events(cart_id, global_id);
+CREATE INDEX IF NOT EXISTS idx_ended_memberships_ended_at ON ended_memberships(ended_at);
 `
 
 // itemFactColumns lists the v3.6 fact columns (TDD §3.1) added to a pre-existing
@@ -165,6 +182,15 @@ var itemFactColumns = []struct{ name, ddl string }{
 	// ADR-096: each content key's own LWW clock, a JSON map from wire key to ts plus a floor entry "*".
 	// NULL on a row written before it: that row's floor is its ts as it stands (readFieldClocks).
 	{"field_ts", "ALTER TABLE items ADD COLUMN field_ts TEXT"},
+	// ADR-101 §1: a row's life. marker is minted by the relay when an add inserts or revives the row;
+	// echo is the 16 bytes that add carried, opaque to the relay. Both are UUID text, uppercase.
+	{"marker", "ALTER TABLE items ADD COLUMN marker TEXT"},
+	{"echo", "ALTER TABLE items ADD COLUMN echo TEXT"},
+	// ADR-101 §7 (R-609): who began the row's life and who ended it. Each is the actor handleDelta computed
+	// for that op, set where the marker is set and where the row becomes a tombstone. NULL on a row from
+	// before the columns: nothing backfills them.
+	{"added_by", "ALTER TABLE items ADD COLUMN added_by TEXT"},
+	{"deleted_by", "ALTER TABLE items ADD COLUMN deleted_by TEXT"},
 }
 
 // ---------------------------------------------------------------------------
@@ -204,8 +230,11 @@ func InitDB(path string) (*sql.DB, error) {
 	if err := migrateItemsCompositeKey(db); err != nil {
 		return nil, fmt.Errorf("InitDB composite-key migrate: %w", err)
 	}
+	if err := migrateItemLives(db); err != nil {
+		return nil, fmt.Errorf("InitDB life migrate: %w", err)
+	}
 
-	pruneDeletedItems(db)
+	pruneExpired(db)
 	return db, nil
 }
 
@@ -252,7 +281,7 @@ func migrateItemsCompositeKey(db *sql.DB) error {
 		purchase_store_brand, purchase_cancelled,
 		category_hint_name, category_hint_icon, category_hint_color, store_hint_brand,
 		last_wanted_at, quiet_until_first_purchase,
-		attributed_to, ts, field_ts, device_id, deleted, deleted_at`
+		attributed_to, ts, field_ts, device_id, deleted, deleted_at, marker, echo, added_by, deleted_by`
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -277,6 +306,47 @@ func migrateItemsCompositeKey(db *sql.DB) error {
 		return err
 	}
 	log.Printf("migrateItemsCompositeKey: items rebuilt with PRIMARY KEY (cart_id, id)")
+	return nil
+}
+
+// migrateItemLives gives every live row that has no life a fresh marker and no echo (ADR-101 §1). A row
+// written before the columns existed is the only one that can lack a marker: an add always mints one.
+// Tombstones get neither, and prune within 30 days. Idempotent: a second run finds no live row without one.
+func migrateItemLives(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT cart_id, id FROM items WHERE deleted = 0 AND marker IS NULL`)
+	if err != nil {
+		return err
+	}
+	var keys [][2]string
+	for rows.Next() {
+		var k [2]string
+		if err := rows.Scan(&k[0], &k[1]); err != nil {
+			rows.Close()
+			return err
+		}
+		keys = append(keys, k)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if _, err := tx.Exec(`UPDATE items SET marker = ? WHERE cart_id = ? AND id = ?`, newMarker(), k[0], k[1]); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if len(keys) > 0 {
+		log.Printf("migrateItemLives: gave %d live rows a marker", len(keys))
+	}
 	return nil
 }
 
@@ -324,16 +394,27 @@ func existingColumns(db *sql.DB, table string) (map[string]bool, error) {
 	return cols, rows.Err()
 }
 
-// pruneDeletedItems removes tombstones older than 30 days.
-func pruneDeletedItems(db *sql.DB) {
-	cutoff := float64(time.Now().Add(-30 * 24 * time.Hour).Unix())
-	res, err := db.Exec(`DELETE FROM items WHERE deleted=1 AND deleted_at < ?`, cutoff)
-	if err != nil {
-		log.Printf("pruneDeletedItems: %v", err)
-		return
-	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		log.Printf("pruneDeletedItems: removed %d tombstones", n)
+// retention is how long the relay keeps a tombstone, and an ended membership's final list (ADR-101 §4).
+const retention = 30 * 24 * time.Hour
+
+func retentionCutoff() float64 { return float64(time.Now().Add(-retention).Unix()) }
+
+// pruneExpired removes tombstones and ended memberships older than the retention window. It runs at startup
+// and hourly.
+func pruneExpired(db *sql.DB) {
+	cutoff := retentionCutoff()
+	for _, p := range []struct{ what, stmt string }{
+		{"tombstones", `DELETE FROM items WHERE deleted=1 AND deleted_at < ?`},
+		{"ended memberships", `DELETE FROM ended_memberships WHERE ended_at < ?`},
+	} {
+		res, err := db.Exec(p.stmt, cutoff)
+		if err != nil {
+			log.Printf("pruneExpired %s: %v", p.what, err)
+			continue
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			log.Printf("pruneExpired: removed %d %s", n, p.what)
+		}
 	}
 }
 
@@ -513,10 +594,66 @@ func ResolveSubKey(db *sql.DB, subKey string) (cartID, userID string, ok bool, e
 	return c, u, true, nil
 }
 
-// RemoveMember deletes a member record.
-func RemoveMember(db *sql.DB, cartID, userID string) error {
-	_, err := db.Exec(`DELETE FROM members WHERE cart_id = ? AND user_id = ?`, cartID, userID)
-	return err
+// RemoveMember ends a membership, by a revoke or a leave, and returns its final list (ADR-101 §4): the
+// cart's live rows as they stand at that moment, each with its life and its ts. The list is kept in
+// ended_memberships under the key the membership held, in the same transaction that deletes the member row,
+// so no op can land between the two. It returns nil when there was no membership to end, and a non-nil list,
+// possibly empty, when there was: the list's presence is what tells the account it was removed.
+func RemoveMember(db *sql.DB, cartID, userID string) ([]ItemRow, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var subKey string
+	err = tx.QueryRow(`SELECT sub_key FROM members WHERE cart_id = ? AND user_id = ?`, cartID, userID).Scan(&subKey)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	list, err := GetItems(tx, cartID)
+	if err != nil {
+		return nil, err
+	}
+	if list == nil {
+		list = []ItemRow{}
+	}
+	rows, err := json.Marshal(list)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO ended_memberships (sub_key, cart_id, user_id, ended_at, rows) VALUES (?, ?, ?, ?, ?)
+	`, subKey, cartID, userID, float64(time.Now().Unix()), string(rows)); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`DELETE FROM members WHERE cart_id = ? AND user_id = ?`, cartID, userID); err != nil {
+		return nil, err
+	}
+	return list, tx.Commit()
+}
+
+// FinalList returns the final list kept for an ended key of cartID, or nil when there is none: the key never
+// ended a membership of that cart, or its list is past the retention window.
+func FinalList(db *sql.DB, subKey, cartID string) ([]ItemRow, error) {
+	var raw string
+	err := db.QueryRow(`
+		SELECT rows FROM ended_memberships WHERE sub_key = ? AND cart_id = ? AND ended_at >= ?
+	`, subKey, cartID, retentionCutoff()).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	list := []ItemRow{}
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		return nil, err
+	}
+	return list, nil
 }
 
 // GetMembers returns all members of a cart with their user metadata.
@@ -560,16 +697,116 @@ func GetMembers(db *sql.DB, cartID string) ([]MemberInfo, error) {
 // Items
 // ---------------------------------------------------------------------------
 
+// itemRowColumns and scanItemRow are the one reading of an item row into its wire shape, shared by the
+// state (GetItems) and the ack (readRow), so an ack never carries a row the state would show differently.
+const itemRowColumns = `id, COALESCE(title,''), quantity, checked, attributed_to, ts,
+       notes, specification, COALESCE(urgency_level,1),
+       global_id, frequency_days, COALESCE(is_active,1),
+       paused_at, pause_reason, deferred_guess_date, deferred_guess_authored_at, purchased_at,
+       purchase_store_brand, COALESCE(purchase_cancelled,0),
+       category_hint_name, category_hint_icon, category_hint_color, store_hint_brand,
+       last_wanted_at, COALESCE(quiet_until_first_purchase,0),
+       COALESCE(marker,''), COALESCE(echo,''), COALESCE(added_by,'')`
+
+// tombstoneRowColumns is the same for a tombstone: its id, its death instant, and the life it ended.
+const tombstoneRowColumns = `id, COALESCE(deleted_at, ts), COALESCE(marker,''), COALESCE(echo,''), COALESCE(added_by,''), COALESCE(deleted_by,'')`
+
+// scanner is what *sql.Row and *sql.Rows both offer.
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanItemRow(sc scanner) (ItemRow, error) {
+	var item ItemRow
+	var attributedTo sql.NullString
+	var notes sql.NullString
+	var specification sql.NullString
+	var globalID sql.NullString
+	var frequencyDays sql.NullInt64
+	var pausedAt sql.NullFloat64
+	var pauseReason sql.NullString
+	var deferredGuessDate sql.NullFloat64
+	var deferredGuessAuthoredAt sql.NullFloat64
+	var purchasedAt sql.NullFloat64
+	var purchaseStoreBrand sql.NullString
+	var categoryHintName sql.NullString
+	var categoryHintIcon sql.NullString
+	var categoryHintColor sql.NullString
+	var storeHintBrand sql.NullString
+	var lastWantedAt sql.NullFloat64
+	if err := sc.Scan(
+		&item.ID, &item.Title, &item.Quantity, &item.Checked,
+		&attributedTo, &item.Ts,
+		&notes, &specification, &item.UrgencyLevel,
+		&globalID, &frequencyDays, &item.IsActive,
+		&pausedAt, &pauseReason, &deferredGuessDate, &deferredGuessAuthoredAt, &purchasedAt,
+		&purchaseStoreBrand, &item.Cancels,
+		&categoryHintName, &categoryHintIcon, &categoryHintColor, &storeHintBrand,
+		&lastWantedAt, &item.QuietUntilFirstPurchase,
+		&item.Marker, &item.Echo, &item.AddedBy,
+	); err != nil {
+		return ItemRow{}, err
+	}
+	if attributedTo.Valid {
+		item.AttributedTo = &attributedTo.String
+	}
+	if notes.Valid {
+		item.Notes = &notes.String
+	}
+	if specification.Valid {
+		item.Specification = &specification.String
+	}
+	if globalID.Valid {
+		item.GlobalID = &globalID.String
+	}
+	if frequencyDays.Valid {
+		fd := int(frequencyDays.Int64)
+		item.FrequencyDays = &fd
+	}
+	if pausedAt.Valid {
+		item.PausedAt = &pausedAt.Float64
+	}
+	if pauseReason.Valid {
+		item.PauseReason = &pauseReason.String
+	}
+	if deferredGuessDate.Valid {
+		item.DeferredGuessDate = &deferredGuessDate.Float64
+	}
+	if deferredGuessAuthoredAt.Valid {
+		item.DeferredGuessAuthoredAt = &deferredGuessAuthoredAt.Float64
+	}
+	if purchasedAt.Valid {
+		item.PurchasedAt = &purchasedAt.Float64
+	}
+	if purchaseStoreBrand.Valid {
+		item.PurchaseStoreBrand = &purchaseStoreBrand.String
+	}
+	if categoryHintName.Valid {
+		item.CategoryHintName = &categoryHintName.String
+	}
+	if categoryHintIcon.Valid {
+		item.CategoryHintIcon = &categoryHintIcon.String
+	}
+	if categoryHintColor.Valid {
+		item.CategoryHintColor = &categoryHintColor.String
+	}
+	if storeHintBrand.Valid {
+		item.StoreHintBrand = &storeHintBrand.String
+	}
+	if lastWantedAt.Valid {
+		item.LastWantedAt = &lastWantedAt.Float64
+	}
+	return item, nil
+}
+
+// rowsQuerier is what *sql.DB and *sql.Tx both offer for a multi-row read.
+type rowsQuerier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
 // GetItems returns all non-deleted items for a cart.
-func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
-	rows, err := db.Query(`
-		SELECT id, COALESCE(title,''), quantity, checked, attributed_to, ts,
-		       notes, specification, COALESCE(urgency_level,1),
-		       global_id, frequency_days, COALESCE(is_active,1),
-		       paused_at, pause_reason, deferred_guess_date, deferred_guess_authored_at, purchased_at,
-		       purchase_store_brand, COALESCE(purchase_cancelled,0),
-		       category_hint_name, category_hint_icon, category_hint_color, store_hint_brand,
-		       last_wanted_at, COALESCE(quiet_until_first_purchase,0)
+func GetItems(db rowsQuerier, cartID string) ([]ItemRow, error) {
+	rows, err := db.Query(`SELECT `+itemRowColumns+`
 		FROM items
 		WHERE cart_id = ? AND deleted = 0
 		ORDER BY ts ASC
@@ -581,83 +818,9 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 
 	var items []ItemRow
 	for rows.Next() {
-		var item ItemRow
-		var attributedTo sql.NullString
-		var notes sql.NullString
-		var specification sql.NullString
-		var globalID sql.NullString
-		var frequencyDays sql.NullInt64
-		var pausedAt sql.NullFloat64
-		var pauseReason sql.NullString
-		var deferredGuessDate sql.NullFloat64
-		var deferredGuessAuthoredAt sql.NullFloat64
-		var purchasedAt sql.NullFloat64
-		var purchaseStoreBrand sql.NullString
-		var categoryHintName sql.NullString
-		var categoryHintIcon sql.NullString
-		var categoryHintColor sql.NullString
-		var storeHintBrand sql.NullString
-		var lastWantedAt sql.NullFloat64
-		if err := rows.Scan(
-			&item.ID, &item.Title, &item.Quantity, &item.Checked,
-			&attributedTo, &item.Ts,
-			&notes, &specification, &item.UrgencyLevel,
-			&globalID, &frequencyDays, &item.IsActive,
-			&pausedAt, &pauseReason, &deferredGuessDate, &deferredGuessAuthoredAt, &purchasedAt,
-			&purchaseStoreBrand, &item.Cancels,
-			&categoryHintName, &categoryHintIcon, &categoryHintColor, &storeHintBrand,
-			&lastWantedAt, &item.QuietUntilFirstPurchase,
-		); err != nil {
+		item, err := scanItemRow(rows)
+		if err != nil {
 			return nil, err
-		}
-		if attributedTo.Valid {
-			item.AttributedTo = &attributedTo.String
-		}
-		if notes.Valid {
-			item.Notes = &notes.String
-		}
-		if specification.Valid {
-			item.Specification = &specification.String
-		}
-		if globalID.Valid {
-			item.GlobalID = &globalID.String
-		}
-		if frequencyDays.Valid {
-			fd := int(frequencyDays.Int64)
-			item.FrequencyDays = &fd
-		}
-		if pausedAt.Valid {
-			item.PausedAt = &pausedAt.Float64
-		}
-		if pauseReason.Valid {
-			item.PauseReason = &pauseReason.String
-		}
-		if deferredGuessDate.Valid {
-			item.DeferredGuessDate = &deferredGuessDate.Float64
-		}
-		if deferredGuessAuthoredAt.Valid {
-			item.DeferredGuessAuthoredAt = &deferredGuessAuthoredAt.Float64
-		}
-		if purchasedAt.Valid {
-			item.PurchasedAt = &purchasedAt.Float64
-		}
-		if purchaseStoreBrand.Valid {
-			item.PurchaseStoreBrand = &purchaseStoreBrand.String
-		}
-		if categoryHintName.Valid {
-			item.CategoryHintName = &categoryHintName.String
-		}
-		if categoryHintIcon.Valid {
-			item.CategoryHintIcon = &categoryHintIcon.String
-		}
-		if categoryHintColor.Valid {
-			item.CategoryHintColor = &categoryHintColor.String
-		}
-		if storeHintBrand.Valid {
-			item.StoreHintBrand = &storeHintBrand.String
-		}
-		if lastWantedAt.Valid {
-			item.LastWantedAt = &lastWantedAt.Float64
 		}
 		items = append(items, item)
 	}
@@ -665,10 +828,8 @@ func GetItems(db *sql.DB, cartID string) ([]ItemRow, error) {
 }
 
 // GetTombstones returns all soft-deleted rows for a cart (ADR-038 invariant A).
-func GetTombstones(db *sql.DB, cartID string) ([]TombstoneRow, error) {
-	rows, err := db.Query(`
-		SELECT id, COALESCE(deleted_at, ts) FROM items WHERE cart_id = ? AND deleted = 1
-	`, cartID)
+func GetTombstones(db rowsQuerier, cartID string) ([]TombstoneRow, error) {
+	rows, err := db.Query(`SELECT `+tombstoneRowColumns+` FROM items WHERE cart_id = ? AND deleted = 1`, cartID)
 	if err != nil {
 		return nil, err
 	}
@@ -677,12 +838,59 @@ func GetTombstones(db *sql.DB, cartID string) ([]TombstoneRow, error) {
 	var tombstones []TombstoneRow
 	for rows.Next() {
 		var t TombstoneRow
-		if err := rows.Scan(&t.ID, &t.DeletedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.DeletedAt, &t.Marker, &t.Echo, &t.AddedBy, &t.DeletedBy); err != nil {
 			return nil, err
 		}
 		tombstones = append(tombstones, t)
 	}
 	return tombstones, rows.Err()
+}
+
+// GetCartRows reads a cart's live rows and its tombstones in ONE read-only transaction, so a write cannot land
+// between the two reads and show one row in both lists (ADR-101 §9): a row appears in exactly one. Inside the
+// transaction only tx is used. MaxOpenConns is 1, so any helper that took db here would wait for the one
+// connection the transaction holds, forever.
+func GetCartRows(db *sql.DB, cartID string) ([]ItemRow, []TombstoneRow, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	items, err := GetItems(tx, cartID)
+	if err != nil {
+		return nil, nil, err
+	}
+	tombstones, err := GetTombstones(tx, cartID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return items, tombstones, nil
+}
+
+// readRow reads one row as the cart's state would show it (ADR-101 §2): a live row as an ItemRow, a
+// tombstone as a TombstoneRow, and a missing row as neither.
+func readRow(q querier, cartID, itemID string) (*ItemRow, *TombstoneRow, error) {
+	var deleted bool
+	err := q.QueryRow(`SELECT deleted FROM items WHERE cart_id = ? AND id = ?`, cartID, itemID).Scan(&deleted)
+	if err == sql.ErrNoRows {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if deleted {
+		var t TombstoneRow
+		if err := q.QueryRow(`SELECT `+tombstoneRowColumns+` FROM items WHERE cart_id = ? AND id = ?`, cartID, itemID).
+			Scan(&t.ID, &t.DeletedAt, &t.Marker, &t.Echo, &t.AddedBy, &t.DeletedBy); err != nil {
+			return nil, nil, err
+		}
+		return nil, &t, nil
+	}
+	item, err := scanItemRow(q.QueryRow(`SELECT `+itemRowColumns+` FROM items WHERE cart_id = ? AND id = ?`, cartID, itemID))
+	if err != nil {
+		return nil, nil, err
+	}
+	return &item, nil, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +1068,10 @@ type OpOutcome struct {
 	Broadcast bool           // peers must hear of it
 	Fields    map[string]any // the op's keys that took effect — exactly what a broadcast relays
 	Rescued   bool           // an older edit won a key below the row clock: members need the cart's state (ADR-096 §5)
+	// The row as it stands after the op, read in the op's own transaction (ADR-101 §2): a live row, a
+	// tombstone, or neither when no row exists.
+	Item      *ItemRow
+	Tombstone *TombstoneRow
 }
 
 // ApplyOp applies one op in one transaction. The op splits by its keys (R-585): the CONTENT part follows
@@ -870,23 +1082,33 @@ type OpOutcome struct {
 // tombstone, apply neither part.
 func ApplyOp(
 	db *sql.DB,
-	cartID, itemID, op string,
-	fields map[string]any,
+	cartID string,
+	o Op,
 	ts float64,
 	deviceID, userID string,
 ) (OpOutcome, error) {
+	itemID, op, fields := o.ID, o.Op, o.Fields
 	tx, err := db.Begin()
 	if err != nil {
 		return OpOutcome{}, err
 	}
 	defer tx.Rollback()
 
-	lww, err := ApplyLWW(tx, cartID, itemID, op, fields, ts, deviceID)
-	if err != nil || lww.refused {
+	lww, err := ApplyLWW(tx, cartID, o, ts, deviceID, userID)
+	if err != nil {
 		return OpOutcome{}, err
 	}
+	if lww.refused {
+		var out OpOutcome
+		out.Item, out.Tombstone, err = readRow(tx, cartID, itemID)
+		return out, err
+	}
 	if op == "delete" {
-		return OpOutcome{Applied: true, Broadcast: true, Fields: fields}, tx.Commit()
+		out := OpOutcome{Applied: true, Broadcast: true, Fields: fields}
+		if out.Item, out.Tombstone, err = readRow(tx, cartID, itemID); err != nil {
+			return OpOutcome{}, err
+		}
+		return out, tx.Commit()
 	}
 
 	var row completionPair
@@ -944,6 +1166,9 @@ func ApplyOp(
 		out.Fields[k] = val
 	}
 	out.Broadcast = len(out.Fields) > 0
+	if out.Item, out.Tombstone, err = readRow(tx, cartID, itemID); err != nil {
+		return OpOutcome{}, err
+	}
 	return out, tx.Commit()
 }
 
@@ -1133,11 +1358,12 @@ func encodeFieldClocks(clocks map[string]float64) string {
 // and apply all of their content only when their ts beats the row clock. The row clock never goes down.
 func ApplyLWW(
 	q querier,
-	cartID, itemID, op string,
-	fields map[string]any,
+	cartID string,
+	o Op,
 	ts float64,
-	deviceID string,
+	deviceID, actor string,
 ) (lwwVerdict, error) {
+	itemID, op, fields := o.ID, o.Op, o.Fields
 	refused := lwwVerdict{refused: true}
 	// Clamp ts: prevent far-future clients from permanently winning all conflicts.
 	effectiveTs := ts
@@ -1149,16 +1375,32 @@ func ApplyLWW(
 		// A delete of a row that exists and is already tombstoned changes nothing: refused, so peers are
 		// not told twice and deleted_at is not extended (ADR-098 §3).
 		var already int
-		if err := q.QueryRow(`SELECT deleted FROM items WHERE id=? AND cart_id=?`, itemID, cartID).Scan(&already); err == nil && already == 1 {
+		var marker, echo string
+		err := q.QueryRow(`SELECT deleted, COALESCE(marker,''), COALESCE(echo,'') FROM items WHERE id=? AND cart_id=?`, itemID, cartID).
+			Scan(&already, &marker, &echo)
+		if err != nil && err != sql.ErrNoRows {
+			return refused, err
+		}
+		if err == nil && already == 1 {
 			log.Printf("ApplyLWW: delete skipped on tombstoned item %s/%s", cartID, itemID)
 			return refused, nil
+		}
+		// A delete that names a selector ends a life only if every selector it names matches the live one
+		// (ADR-101 §3). Anything else changes nothing, and it never inserts a tombstone over a missing row:
+		// that tombstone exists to stop a stale add, and a named life that is not here leaves none to stop.
+		// A delete naming neither keeps the rule below, whichever build sent it.
+		if o.Marker != "" || o.Echo != "" {
+			if err == sql.ErrNoRows || o.Marker != "" && o.Marker != marker || o.Echo != "" && o.Echo != echo {
+				log.Printf("ApplyLWW: delete skipped on %s/%s — it names a life that is not the live one", cartID, itemID)
+				return refused, nil
+			}
 		}
 
 		// Soft-delete: mark deleted + deleted_at. If row doesn't exist, insert a
 		// tombstone so stale add ops can't resurrect the item.
 		res, err := q.Exec(`
-			UPDATE items SET deleted=1, deleted_at=? WHERE id=? AND cart_id=?
-		`, effectiveTs, itemID, cartID)
+			UPDATE items SET deleted=1, deleted_at=?, deleted_by=? WHERE id=? AND cart_id=?
+		`, effectiveTs, actor, itemID, cartID)
 		if err != nil {
 			return refused, err
 		}
@@ -1166,9 +1408,9 @@ func ApplyLWW(
 		if n == 0 {
 			// No existing row — insert tombstone.
 			_, err = q.Exec(`
-				INSERT INTO items (id, cart_id, ts, device_id, deleted, deleted_at)
-				VALUES (?, ?, ?, ?, 1, ?)
-			`, itemID, cartID, effectiveTs, deviceID, effectiveTs)
+				INSERT INTO items (id, cart_id, ts, device_id, deleted, deleted_at, deleted_by)
+				VALUES (?, ?, ?, ?, 1, ?, ?)
+			`, itemID, cartID, effectiveTs, deviceID, effectiveTs, actor)
 			if err != nil {
 				return refused, err
 			}
@@ -1206,7 +1448,7 @@ func ApplyLWW(
 			log.Printf("ApplyLWW: update skipped on missing item %s/%s — only an add creates", cartID, itemID)
 			return refused, nil
 		}
-		if err := insertItem(q, cartID, itemID, fields, effectiveTs, deviceID); err != nil {
+		if err := insertItem(q, cartID, itemID, fields, o.Echo, effectiveTs, deviceID, actor); err != nil {
 			return refused, err
 		}
 		return lwwVerdict{won: contentKeysOf(fields), rowWon: true, rose: true}, nil
@@ -1237,6 +1479,11 @@ func ApplyLWW(
 		rose:   effectiveTs > existing.ts,
 	}
 	rebirth := op == "add" && v.rowWon // a re-add over a stale tombstone, or over a live row it beat
+	// Only a re-add over a tombstone begins a new life (ADR-101 §1); an add that beats a live row keeps it.
+	var life *rowLife
+	if rebirth && existing.deleted == 1 {
+		life = beginLife(o.Echo, actor)
+	}
 	clocks := readFieldClocks(existing.fieldTs, existing.ts)
 	var lost []string
 	switch {
@@ -1281,7 +1528,7 @@ func ApplyLWW(
 	for k := range v.won {
 		content[k] = fields[k]
 	}
-	if err := updateItem(q, cartID, itemID, rebirth, content, rowTs, rowDevice, encodeFieldClocks(clocks)); err != nil {
+	if err := updateItem(q, cartID, itemID, rebirth, life, content, rowTs, rowDevice, encodeFieldClocks(clocks)); err != nil {
 		return refused, err
 	}
 	return v, nil
@@ -1311,16 +1558,30 @@ func sortedKeys(set map[string]bool, rescued bool) []string {
 	return out
 }
 
-// insertItem creates a row from an add's content part. Its completion columns start empty — an
+// rowLife is the life an add begins (ADR-101 §1): a marker the relay mints, and the echo the add carried,
+// NULL when it carried none.
+type rowLife struct {
+	marker  string
+	echo    sql.NullString
+	addedBy string // the actor of the add that began it (ADR-101 §7)
+}
+
+func beginLife(echo, actor string) *rowLife {
+	return &rowLife{marker: newMarker(), echo: sql.NullString{String: echo, Valid: echo != ""}, addedBy: actor}
+}
+
+// insertItem creates a row from an add's content part, and begins its life. Its completion columns start empty — an
 // unchecked item nobody has bought — and decideCompletion applies the add's act, if it carries one.
 // The want register starts empty too: decideWant applies the add's lastWantedAt.
 func insertItem(
 	q querier,
 	cartID, itemID string,
 	fields map[string]any,
+	echo string,
 	ts float64,
-	deviceID string,
+	deviceID, actor string,
 ) error {
+	life := beginLife(echo, actor)
 	title, _ := fields["title"].(string)
 	quantity := 1
 	if q, ok := fields["quantity"].(float64); ok {
@@ -1402,14 +1663,14 @@ func insertItem(
 		     global_id, frequency_days, is_active, paused_at, pause_reason, deferred_guess_date,
 		     deferred_guess_authored_at, category_hint_name, category_hint_icon,
 		     category_hint_color, store_hint_brand, quiet_until_first_purchase,
-		     ts, field_ts, device_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		     ts, field_ts, device_id, marker, echo, added_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, itemID, cartID, title, quantity,
 		notes, specification, urgencyLevel,
 		globalID, frequencyDays, boolToInt(isActive), pausedAt, pauseReason, deferredGuessDate,
 		deferredGuessAuthoredAt, categoryHintName, categoryHintIcon,
 		categoryHintColor, storeHintBrand, boolToInt(quietUntilFirstPurchase),
-		ts, encodeFieldClocks(map[string]float64{fieldFloor: ts}), deviceID)
+		ts, encodeFieldClocks(map[string]float64{fieldFloor: ts}), deviceID, life.marker, life.echo, life.addedBy)
 	return err
 }
 
@@ -1459,6 +1720,7 @@ func updateItem(
 	q querier,
 	cartID, itemID string,
 	rebirth bool,
+	life *rowLife,
 	fields map[string]any,
 	ts float64,
 	deviceID, fieldTs string,
@@ -1471,7 +1733,11 @@ func updateItem(
 	// resurrect (ADR-039). ApplyLWW already blocks update-over-tombstone,
 	// so this both effects the intended add-resurrect and is defense in depth.
 	if rebirth {
-		setClauses += ", deleted=0, deleted_at=NULL"
+		setClauses += ", deleted=0, deleted_at=NULL, deleted_by=NULL"
+	}
+	if life != nil {
+		setClauses += ", marker=?, echo=?, added_by=?"
+		args = append(args, life.marker, life.echo, life.addedBy)
 	}
 
 	if v, ok := fields["title"]; ok {

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 )
 
 // ---------------------------------------------------------------------------
@@ -11,13 +12,19 @@ import (
 // ---------------------------------------------------------------------------
 
 // Wire protocol version (TDD §3.3). Absent v/minV on the wire = 1 (pre-version
-// peers). The server stamps both on every state message and never checks a
-// client's v: a client below minV refuses the state, stops syncing and asks
-// its user to update. Raised to 2 on 1.8.21's release day (R-585), so a
-// pre-1.8.21 build stops syncing shared carts.
+// peers). The server stamps both on every state message: a client below minV
+// refuses the state, stops syncing and asks its user to update. minV was raised
+// to 2 on 1.8.21's release day (R-585), so a pre-1.8.21 build stops syncing
+// shared carts.
+//
+// The server speaks 2, 3 and 4 at once (ADR-101 §8): 3 and 4 only add keys a
+// v2 build ignores. The one place it reads a client's v is the delta fan-out:
+// a connection whose subscription declares ownDeviceFanOut or later also hears
+// its own account's other connections (ADR-101 §6).
 const (
-	protocolVersion  = 2 // the protocol version this server speaks
+	protocolVersion  = 4 // the highest protocol version this server speaks
 	minClientVersion = 2 // lowest client protocol version the server serves
+	ownDeviceFanOut  = 4 // the version from which a connection hears its own account's deltas
 )
 
 // StateMsg is sent by the server to the client immediately after WebSocket connect.
@@ -41,12 +48,23 @@ type AckMsg struct {
 	ItemID string  `json:"itemID"`
 	Ts     float64 `json:"ts"`
 	Status string  `json:"status"` // "applied" | "discarded" | "rejected"
+	// The row as the cart's state would show it after the relay applied or declined the op (ADR-101 §2):
+	// one of the two for applied and discarded, when the row exists, and neither for rejected, because
+	// nothing was read. The same shapes as the state's, so the life and the ts arrive with the ack.
+	Item      *ItemRow      `json:"item,omitempty"`
+	Tombstone *TombstoneRow `json:"tombstone,omitempty"`
 }
 
-// TombstoneRow is a soft-deleted item surfaced in state messages (ADR-038 invariant A).
+// TombstoneRow is a soft-deleted item surfaced in state messages (ADR-038 invariant A). It carries the
+// life it ended (ADR-101 §1); a tombstone that ended no life the relay knows of carries none.
 type TombstoneRow struct {
 	ID        string  `json:"id"`
 	DeletedAt float64 `json:"deletedAt"`
+	Marker    string  `json:"marker,omitempty"`
+	Echo      string  `json:"echo,omitempty"`
+	// Who began the life this tombstone ended, and who ended it (ADR-101 §7); absent = not recorded.
+	AddedBy   string `json:"addedBy,omitempty"`
+	DeletedBy string `json:"deletedBy,omitempty"`
 }
 
 // DeltaMsg is the delta wire format (client→server and server→other clients).
@@ -66,12 +84,29 @@ type Op struct {
 	Op     string         `json:"op"` // "add" | "update" | "delete"
 	ID     string         `json:"id"` // item UUID
 	Fields map[string]any `json:"fields,omitempty"`
+	// Marker and Echo name a row's life (ADR-101 §1), beside the id and never inside fields, because a life
+	// is not content. On an add, Echo is the 16 bytes the adding device chose; the relay keeps it with the
+	// life the add begins. On a delete, either one is a selector: the delete ends only the life it names
+	// (ADR-101 §3). On a relayed add or delete they are the row's life as the relay holds it.
+	Marker string `json:"marker,omitempty"`
+	Echo   string `json:"echo,omitempty"`
 	// Actor opts an op out of userID injection: "system" (systemActor) attributes
 	// the write to the reserved system sentinel instead of the connection's userID
 	// (RULE[sharing.system-attribution] — staleness auto-pause and other
 	// device-derived household decisions are attributed to system, not a member).
 	// Any other value is ignored and the connection's userID is used as normal.
 	Actor string `json:"actor,omitempty"`
+}
+
+// uppercaseIDs puts every id the relay keys a row by into one case at receipt (ADR-101 §5): the item id,
+// the globalID when it is a string, and the life's marker and echo. Every build already sends uppercase;
+// this makes a lowercase sender name the same row instead of a second one. Cart ids are not touched: they
+// stay lowercase.
+func (o *Op) uppercaseIDs() {
+	o.ID, o.Marker, o.Echo = strings.ToUpper(o.ID), strings.ToUpper(o.Marker), strings.ToUpper(o.Echo)
+	if g, ok := o.Fields["globalID"].(string); ok {
+		o.Fields["globalID"] = strings.ToUpper(g)
+	}
 }
 
 // systemActor is the reserved attribution sentinel for device-derived household
@@ -89,7 +124,14 @@ type MemberInfo struct {
 // ItemRow is the item representation used in state messages and REST responses.
 // Tombstoned items are never included.
 type ItemRow struct {
-	ID                string   `json:"id"`
+	ID string `json:"id"`
+	// The row's life (ADR-101 §1): the marker the relay minted when an add created or revived the row, and
+	// the echo that add carried. Every live row has a marker; echo is absent when the add carried none.
+	Marker string `json:"marker,omitempty"`
+	Echo   string `json:"echo,omitempty"`
+	// Who began this life (ADR-101 §7): the actor of the add that created or revived the row. Absent = not
+	// recorded. A live row has no deleter.
+	AddedBy           string   `json:"addedBy,omitempty"`
 	Title             string   `json:"title"`
 	Quantity          int      `json:"quantity"`
 	Checked           bool     `json:"checked"`
@@ -177,6 +219,9 @@ type MemberRemovedMsg struct {
 	Type   string `json:"type"`   // "member_removed"
 	CartID string `json:"cartID"` // the cart the member was removed from
 	UserID string `json:"userID"` // the removed member's userID
+	// FinalList is the removed account's final list (ADR-101 §4), on its own connections' copy only. A
+	// pointer so an empty list still travels as [] while every other copy carries no key.
+	FinalList *[]ItemRow `json:"finalList,omitempty"`
 }
 
 // SecretRotatedMsg is sent to remaining connected members after a revoke.
@@ -234,6 +279,10 @@ type SubscribeResultMsg struct {
 type SubscribeReject struct {
 	CartID string `json:"cartID"`
 	Reason string `json:"reason"`
+	// FinalList rides an unknown_key refusal of a key whose membership ended within the retention window
+	// (ADR-101 §4). The reason stays unknown_key, which every build acts on; the list's presence is what
+	// says the account was removed. Absent for every other refusal.
+	FinalList *[]ItemRow `json:"finalList,omitempty"`
 }
 
 // Rejection reasons. They distinguish "you are not in this cart any more" from
@@ -287,6 +336,10 @@ func generateSubKey() string {
 	}
 	return hex.EncodeToString(b)
 }
+
+// newMarker mints a row life's marker (ADR-101 §1): 16 random bytes as UUID text, uppercase like every
+// id the relay keys a row by.
+func newMarker() string { return strings.ToUpper(newUUID()) }
 
 // newUUID returns a random UUID v4 string.
 func newUUID() string {

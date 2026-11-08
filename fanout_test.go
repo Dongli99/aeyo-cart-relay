@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -102,7 +103,7 @@ func tombstoneDeletedAt(t *testing.T, db *sql.DB, cartID, id string) (float64, b
 	t.Helper()
 	var at sql.NullFloat64
 	var deleted int
-	err := db.QueryRow(`SELECT deleted, deleted_at FROM items WHERE id=? AND cart_id=?`, id, cartID).Scan(&deleted, &at)
+	err := db.QueryRow(`SELECT deleted, deleted_at FROM items WHERE id=? AND cart_id=?`, strings.ToUpper(id), cartID).Scan(&deleted, &at)
 	if err != nil {
 		return 0, false
 	}
@@ -149,7 +150,85 @@ func TestDeleteOfUnseenItemTombstonesAndBlocksOlderAdd(t *testing.T) {
 	if status, ok := drainAck(r.sender); !ok || status != "discarded" {
 		t.Errorf("older add ack = %q ok=%v, want discarded", status, ok)
 	}
-	if _, found := itemTitle(t, r.db, "cart-a", "ghost"); found {
+	if _, found := itemTitle(t, r.db, "cart-a", "GHOST"); found {
 		t.Error("an add older than the tombstone resurrected the item")
+	}
+}
+
+// ADR-101 §6: a connection whose subscription declares protocol 4 also hears its own account's other
+// connections' deltas. It never hears its own, the ack still goes to the sender alone, and every
+// connection below 4 keeps ADR-098 §1.
+func TestOwnDeviceFanOutFollowsTheReceivingConnectionsDeclaration(t *testing.T) {
+	deltas := func(c *Client) int {
+		n := 0
+		for _, b := range drainAll(c) {
+			var m map[string]any
+			if json.Unmarshal(b, &m) == nil && m["type"] == "delta" {
+				n++
+			}
+		}
+		return n
+	}
+	for _, tc := range []struct {
+		name            string
+		sender, sibling int // the protocol each of user-a's connections declared
+		wantSibling     int
+	}{
+		{"both at v2: the sibling hears nothing", 2, 2, 0},
+		{"both at v4: the sibling hears it", 4, 4, 1},
+		{"sender at v2, sibling at v4: the sibling hears it", 2, 4, 1},
+		{"sender at v4, sibling at v2: the sibling hears nothing", 4, 2, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testDB(t)
+			hub := NewHub()
+			sender := joinHubAt(hub, newTestClient("user-a"), tc.sender, "cart-a")
+			sibling := joinHubAt(hub, newTestClient("user-a"), tc.sibling, "cart-a")
+			memberV2 := joinHubAt(hub, newTestClient("user-b"), 2, "cart-a")
+			memberV4 := joinHubAt(hub, newTestClient("user-c"), 4, "cart-a")
+
+			raw, _ := json.Marshal(DeltaMsg{Type: "delta", CartID: "cart-a", DeviceID: "dev-1", Ts: 1000,
+				Ops: []Op{{Op: "add", ID: "ITEM-1", Fields: map[string]any{"title": "Milk"}}}})
+			handleDelta(sender, hub, db, raw)
+
+			var acks, own int
+			for _, b := range drainAll(sender) {
+				var m map[string]any
+				json.Unmarshal(b, &m)
+				switch m["type"] {
+				case "ack":
+					acks++
+				case "delta":
+					own++
+				}
+			}
+			if acks != 1 || own != 0 {
+				t.Errorf("sender got %d acks and %d of its own deltas, want 1 and 0", acks, own)
+			}
+			if n := deltas(sibling); n != tc.wantSibling {
+				t.Errorf("sibling got %d deltas, want %d", n, tc.wantSibling)
+			}
+			if n := deltas(memberV2); n != 1 {
+				t.Errorf("member at v2 got %d deltas, want 1", n)
+			}
+			if n := deltas(memberV4); n != 1 {
+				t.Errorf("member at v4 got %d deltas, want 1", n)
+			}
+		})
+	}
+}
+
+// A re-subscribe declares the version again, and the connection keeps the latest.
+func TestAResubscribeRedeclaresTheVersion(t *testing.T) {
+	db, cartA, _, keyAliceA, _, _ := subTestDB(t)
+	hub := NewHub()
+	c := joinHubAt(hub, newTestClient("alice"), 2, cartA)
+	raw, _ := json.Marshal(SubscribeMsg{Type: "subscribe", V: 4, Carts: []SubscribeCart{{CartID: cartA, SubKey: keyAliceA}}})
+	handleSubscribe(c, hub, db, raw)
+	hub.mu.RLock()
+	v := c.v
+	hub.mu.RUnlock()
+	if v != 4 {
+		t.Errorf("v after a v4 re-subscribe = %d, want 4", v)
 	}
 }

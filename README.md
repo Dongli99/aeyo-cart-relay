@@ -60,7 +60,7 @@ cart at create or join time, returned to that member alone and never broadcast, 
 state message, never in another member's response. The server resolves each key back to the
 `(cart, member)` pair it was minted for
 ([`handlers.go`](handlers.go), `verifySubscription`). The connection's identity comes from
-those keys; nothing about who you are is taken on your word.
+those keys; nothing about who you are is taken on your word, except at a re-join, below.
 
 The same key authenticates **every cart-scoped request**, not only the socket
 ([`handlers.go`](handlers.go), `authorizeCartActor`): leaving a cart, revoking a member,
@@ -78,6 +78,16 @@ Two endpoints are exempt, by construction rather than oversight: **create** and 
 keys come from, so no key can exist yet. Create makes a new room owned by the caller, so an
 unproved identity there grants nothing; join is gated by the invite secret, a credential the
 caller must have been given.
+
+**One residual of that exemption is open, and stated plainly because a reader should be able to
+check it.** A join that names someone who is already a member keeps that member's key and
+returns it, since a re-mint would lock out their other devices. So anyone holding a cart's
+current invite secret can name an existing member, the owner included, and receive that member's
+key for that cart. With it they can act as that member there: take the cart's ownership, remove
+members, or read or rotate the secret. It stays inside that one cart, since keys are minted per
+membership, and it needs the current secret, which only someone invited holds. The fix makes a
+re-join prove itself with the member's own key. That waits for an app release that sends it,
+because today's app re-joins a cart it already holds without one.
 
 **Create lets the caller propose the room's id, and that is worth stating in full**, because it is
 the one place the exemption above was re-examined rather than inherited. A cart's id is immutable
@@ -152,8 +162,28 @@ The parts that matter for privacy, with somewhere to check each:
 - **A device identifier is stored per item row.** It is the tie-break when two devices edit
   the same item at the same timestamp. This is disclosed in Aeyo's privacy policy.
 - **Deleted items are kept as tombstones for 30 days**, then removed
-  ([`db.go`](db.go), `pruneDeletedItems`). Tombstones exist so a delete propagates to a
+  ([`db.go`](db.go), `pruneExpired`). Tombstones exist so a delete propagates to a
   device that was offline; a device gone longer than 30 days can miss one.
+- **Each item row records which life of the item it is.** When an add creates a row, or
+  brings back a deleted one, the server mints a random marker for it and keeps, beside it, 16
+  bytes the adding device chose. Both ride every message that carries the row, and a delete may
+  name either one, so it removes the item it meant and not a later re-add of it. Neither value
+  says who added the item; the marker is random, and the server only compares the device's
+  bytes, never reads them ([`db.go`](db.go), `beginLife` and `ApplyLWW`).
+- **Each item row also records who began its life and who ended it.** `added_by` is the account
+  of the add that created or brought back the row, and `deleted_by` the account of the delete
+  that removed it. Each is the account the connection's key proved, or `system` for an op that
+  opts out, never a value from the message body. Both ride wherever the row rides and stay on a
+  tombstone for its 30 days; a row from before they existed carries neither. Every member of the
+  cart can read them, as they can `attributedTo`. A join's response carries the cart's
+  tombstones as well as its live items.
+- **When someone leaves a cart or is removed from it, the cart's items as they stood at that
+  moment are kept for that person for 30 days**, then removed ([`db.go`](db.go),
+  `RemoveMember` and `pruneExpired`). This is so their devices, including one that was offline
+  at the time, can finish their own copy of the list. It is handed only to that person's own
+  devices, under the key their membership held, and it outlives the cart itself: if the last
+  member leaves, the cart is deleted and this copy is not. Nobody else can read it, and it is a
+  copy of nothing they could not already see while they were a member.
 - **A capped log of check-off timestamps** is kept per cart and item lineage, so a member who
   joins later can warm-start their cadence learning instead of starting blind. It is capped
   at 20 rows and holds timestamps only — no prices, no locations, no receipts.
@@ -172,7 +202,7 @@ The parts that matter for privacy, with somewhere to check each:
 ## Reading the code
 
 ```
-main.go        routes, startup, the hourly tombstone prune
+main.go        routes, startup, the hourly prune of tombstones and ended memberships
 handlers.go    HTTP endpoints — cart create/join/leave/revoke/transfer, invite, history;
                the WebSocket handshake and its subscription check
 hub.go         WebSocket fan-out to the members of a cart, and the per-connection message budget
@@ -190,6 +220,12 @@ row instead: an add, and an update carrying `checked`, `title` and `quantity` to
 whole-item snapshot, which judged field by field would write its stale values into older
 fields). A check-off, an uncheck and "still wanted" follow their own rules, not
 last-write-wins.
+
+**Who hears a change.** A change goes to every other member of the cart. It does not go back to
+the device that sent it, which gets an acknowledgement carrying the row as it now stands. It
+reaches the sender's *own* other devices only when they ask for it, by declaring protocol 4
+when they connect ([`hub.go`](hub.go), `BroadcastDelta`). Below that, a person's own devices
+already share their data through iCloud, and a second copy from here would arrive twice.
 
 **Comments reference internal documents** — `ADR-039`, `TDD §3.3`, and similar. Those are
 Aeyo's decision records and are not published. They are left in place because this is a

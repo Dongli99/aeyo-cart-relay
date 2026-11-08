@@ -35,7 +35,7 @@ func testDB(t *testing.T) *sql.DB {
 // applyOp applies one op the way handleDelta does — content by LWW, completion by act — and reports
 // whether any part of it applied.
 func applyOp(db *sql.DB, cartID, itemID, op string, fields map[string]any, ts float64, deviceID, userID string) (bool, error) {
-	out, err := ApplyOp(db, cartID, itemID, op, fields, ts, deviceID, userID)
+	out, err := ApplyOp(db, cartID, Op{Op: op, ID: itemID, Fields: fields}, ts, deviceID, userID)
 	return out.Applied, err
 }
 
@@ -164,7 +164,7 @@ func TestApplyLWWAddResurrectsTombstoneWithFullFields(t *testing.T) {
 	}
 }
 
-// ADR-039 (c): pruneDeletedItems retention is unchanged — tombstones past 30d
+// ADR-039 (c): pruneExpired retention is unchanged — tombstones past 30d
 // are removed, recent ones kept.
 func TestPruneDeletedItemsRetention(t *testing.T) {
 	db := testDB(t)
@@ -182,7 +182,7 @@ func TestPruneDeletedItemsRetention(t *testing.T) {
 		t.Fatalf("insert recent tombstone: %v", err)
 	}
 
-	pruneDeletedItems(db)
+	pruneExpired(db)
 
 	if _, found := itemDeleted(t, db, "cart-a", "old"); found {
 		t.Errorf("tombstone older than 30d must be pruned")
@@ -1252,7 +1252,7 @@ func TestRemoveMemberRetiresSubKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddMember: %v", err)
 	}
-	if err := RemoveMember(db, "cart-a", "user-a"); err != nil {
+	if _, err := RemoveMember(db, "cart-a", "user-a"); err != nil {
 		t.Fatalf("RemoveMember: %v", err)
 	}
 
@@ -1423,7 +1423,7 @@ func TestGetMembersWhenTheOwnerIsNoLongerAMember(t *testing.T) {
 	twoMemberCart(t, db)
 	setTier(t, db, "user-a", "premium")
 	setTier(t, db, "user-b", "premium")
-	if err := RemoveMember(db, "cart-a", "user-a"); err != nil {
+	if _, err := RemoveMember(db, "cart-a", "user-a"); err != nil {
 		t.Fatalf("RemoveMember: %v", err)
 	}
 

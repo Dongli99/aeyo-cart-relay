@@ -13,8 +13,8 @@ import (
 func wantRig(t *testing.T, stored float64) *sql.DB {
 	t.Helper()
 	db := testDB(t)
-	if _, err := ApplyOp(db, "cart-a", "item-1", "add",
-		map[string]any{"title": "Sunscreen", "lastWantedAt": stored}, 1000, "dev-1", "user-a"); err != nil {
+	if _, err := ApplyOp(db, "cart-a", Op{Op: "add", ID: "item-1", Fields: map[string]any{"title": "Sunscreen", "lastWantedAt": stored}},
+		1000, "dev-1", "user-a"); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	return db
@@ -32,8 +32,8 @@ func storedWant(t *testing.T, db *sql.DB) sql.NullFloat64 {
 func TestWantRegister(t *testing.T) {
 	t.Run("a newer op carrying an older want leaves the register and is not relayed for it", func(t *testing.T) {
 		db := wantRig(t, 5000)
-		out, err := ApplyOp(db, "cart-a", "item-1", "update",
-			map[string]any{"title": "Sunscreen SPF50", "lastWantedAt": 3000.0}, 2000, "dev-2", "user-b")
+		out, err := ApplyOp(db, "cart-a", Op{Op: "update", ID: "item-1", Fields: map[string]any{"title": "Sunscreen SPF50", "lastWantedAt": 3000.0}},
+			2000, "dev-2", "user-b")
 		if err != nil || !out.Applied {
 			t.Fatalf("rename: out=%+v err=%v", out, err)
 		}
@@ -50,12 +50,12 @@ func TestWantRegister(t *testing.T) {
 
 	t.Run("an older op carrying a later want advances the register and relays only the want", func(t *testing.T) {
 		db := wantRig(t, 5000)
-		if _, err := ApplyOp(db, "cart-a", "item-1", "update",
-			map[string]any{"title": "Newer name"}, 3000, "dev-1", "user-a"); err != nil {
+		if _, err := ApplyOp(db, "cart-a", Op{Op: "update", ID: "item-1", Fields: map[string]any{"title": "Newer name"}},
+			3000, "dev-1", "user-a"); err != nil {
 			t.Fatal(err)
 		}
-		out, err := ApplyOp(db, "cart-a", "item-1", "update",
-			map[string]any{"title": "Stale name", "lastWantedAt": 6000.0}, 2000, "dev-2", "user-b")
+		out, err := ApplyOp(db, "cart-a", Op{Op: "update", ID: "item-1", Fields: map[string]any{"title": "Stale name", "lastWantedAt": 6000.0}},
+			2000, "dev-2", "user-b")
 		if err != nil || !out.Applied || !out.Broadcast {
 			t.Fatalf("losing op with later want: out=%+v err=%v", out, err)
 		}
@@ -74,8 +74,8 @@ func TestWantRegister(t *testing.T) {
 
 	t.Run("an equal want is a no-op and is not relayed", func(t *testing.T) {
 		db := wantRig(t, 5000)
-		out, err := ApplyOp(db, "cart-a", "item-1", "update",
-			map[string]any{"lastWantedAt": 5000.0}, 2000, "dev-2", "user-b")
+		out, err := ApplyOp(db, "cart-a", Op{Op: "update", ID: "item-1", Fields: map[string]any{"lastWantedAt": 5000.0}},
+			2000, "dev-2", "user-b")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -89,11 +89,11 @@ func TestWantRegister(t *testing.T) {
 
 	t.Run("an update to a tombstoned row writes no want", func(t *testing.T) {
 		db := wantRig(t, 5000)
-		if _, err := ApplyOp(db, "cart-a", "item-1", "delete", nil, 2000, "dev-1", "user-a"); err != nil {
+		if _, err := ApplyOp(db, "cart-a", Op{Op: "delete", ID: "item-1", Fields: nil}, 2000, "dev-1", "user-a"); err != nil {
 			t.Fatal(err)
 		}
-		out, err := ApplyOp(db, "cart-a", "item-1", "update",
-			map[string]any{"lastWantedAt": 9000.0}, 3000, "dev-2", "user-b")
+		out, err := ApplyOp(db, "cart-a", Op{Op: "update", ID: "item-1", Fields: map[string]any{"lastWantedAt": 9000.0}},
+			3000, "dev-2", "user-b")
 		if err != nil || out.Applied || out.Broadcast {
 			t.Errorf("update over a tombstone: out=%+v err=%v", out, err)
 		}
@@ -104,11 +104,11 @@ func TestWantRegister(t *testing.T) {
 
 	t.Run("an add that lost to a tombstone takes no want", func(t *testing.T) {
 		db := testDB(t)
-		if _, err := ApplyOp(db, "cart-a", "item-1", "delete", nil, 5000, "dev-1", "user-a"); err != nil {
+		if _, err := ApplyOp(db, "cart-a", Op{Op: "delete", ID: "item-1", Fields: nil}, 5000, "dev-1", "user-a"); err != nil {
 			t.Fatal(err)
 		}
-		out, err := ApplyOp(db, "cart-a", "item-1", "add",
-			map[string]any{"title": "Ghost", "lastWantedAt": 4000.0}, 2000, "dev-2", "user-b")
+		out, err := ApplyOp(db, "cart-a", Op{Op: "add", ID: "item-1", Fields: map[string]any{"title": "Ghost", "lastWantedAt": 4000.0}},
+			2000, "dev-2", "user-b")
 		if err != nil || out.Broadcast {
 			t.Errorf("stale add: out=%+v err=%v", out, err)
 		}
@@ -120,8 +120,8 @@ func TestWantRegister(t *testing.T) {
 	t.Run("a far-future or non-numeric want is no want", func(t *testing.T) {
 		db := wantRig(t, 5000)
 		for _, v := range []any{4e12, "soon", nil} {
-			out, err := ApplyOp(db, "cart-a", "item-1", "update",
-				map[string]any{"lastWantedAt": v}, 2000, "dev-2", "user-b")
+			out, err := ApplyOp(db, "cart-a", Op{Op: "update", ID: "item-1", Fields: map[string]any{"lastWantedAt": v}},
+				2000, "dev-2", "user-b")
 			if err != nil || out.Broadcast {
 				t.Errorf("%v: out=%+v err=%v", v, out, err)
 			}

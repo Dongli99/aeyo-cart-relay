@@ -111,12 +111,12 @@ func (r *relayRig) pair(id string) string {
 	var by, brand sql.NullString
 	if err := r.db.QueryRow(
 		`SELECT checked, purchased_at, attributed_to, purchase_store_brand FROM items WHERE cart_id=? AND id=?`,
-		relayCart, id).Scan(&checked, &pa, &by, &brand); err != nil {
+		relayCart, strings.ToUpper(id)).Scan(&checked, &pa, &by, &brand); err != nil {
 		r.t.Fatalf("read pair: %v", err)
 	}
 	bit := "?"
 	var b int
-	if err := r.db.QueryRow(`SELECT purchase_cancelled FROM items WHERE cart_id=? AND id=?`, relayCart, id).
+	if err := r.db.QueryRow(`SELECT purchase_cancelled FROM items WHERE cart_id=? AND id=?`, relayCart, strings.ToUpper(id)).
 		Scan(&b); err == nil {
 		bit = fmt.Sprint(b)
 	}
@@ -139,7 +139,7 @@ func (r *relayRig) pair(id string) string {
 
 func (r *relayRig) content(id string) (title string, ts float64) {
 	r.t.Helper()
-	if err := r.db.QueryRow(`SELECT COALESCE(title,''), ts FROM items WHERE cart_id=? AND id=?`, relayCart, id).
+	if err := r.db.QueryRow(`SELECT COALESCE(title,''), ts FROM items WHERE cart_id=? AND id=?`, relayCart, strings.ToUpper(id)).
 		Scan(&title, &ts); err != nil {
 		r.t.Fatalf("read content: %v", err)
 	}
@@ -148,7 +148,7 @@ func (r *relayRig) content(id string) (title string, ts float64) {
 
 func (r *relayRig) events(spine string) string {
 	r.t.Helper()
-	ev, err := GetConsumptionEvents(r.db, relayCart, spine)
+	ev, err := GetConsumptionEvents(r.db, relayCart, strings.ToUpper(spine)) // the relay keys a spine in uppercase (ADR-101 §5)
 	if err != nil {
 		r.t.Fatalf("GetConsumptionEvents: %v", err)
 	}
@@ -169,7 +169,7 @@ func (r *relayRig) stateRow(id string) map[string]any {
 		r.t.Fatalf("decode state: %v", err)
 	}
 	for _, it := range state.Items {
-		if it["id"] == id {
+		if it["id"] == strings.ToUpper(id) {
 			return it
 		}
 	}
@@ -439,7 +439,7 @@ func TestCompletionTable(t *testing.T) {
 		r.send("user-a", 1500, Op{Op: "delete", ID: "milk"})
 		d := r.send("user-a", 2000, add("milk", map[string]any{"title": "Milk", "globalID": "g1", "checked": false}))
 		expectDelivery(t, d, "applied", "globalID,title")
-		if deleted, _ := itemDeleted(t, r.db, relayCart, "milk"); deleted != 0 {
+		if deleted, _ := itemDeleted(t, r.db, relayCart, "MILK"); deleted != 0 {
 			t.Errorf("re-add did not resurrect the row")
 		}
 		expect(t, "pair", r.pair("milk"), "checked P=1000 by=user-a brand=Acme bit=0")
@@ -459,7 +459,7 @@ func TestCompletionTable(t *testing.T) {
 		d := r.send("user-b", 2000, update("milk", map[string]any{
 			"checked": false, "purchasedAt": 2000.0, "cancels": true}))
 		expectDelivery(t, d, "discarded", notRelayed)
-		if _, found := itemDeleted(t, r.db, relayCart, "milk"); found {
+		if _, found := itemDeleted(t, r.db, relayCart, "MILK"); found {
 			t.Errorf("an update created a row")
 		}
 	})
@@ -472,7 +472,7 @@ func TestCompletionTable(t *testing.T) {
 		d := r.send("user-b", 2000, add("milk", map[string]any{
 			"title": "Milk", "globalID": "g1", "checked": true, "purchasedAt": 2000.0}))
 		expectDelivery(t, d, "discarded", notRelayed)
-		if deleted, _ := itemDeleted(t, r.db, relayCart, "milk"); deleted != 1 {
+		if deleted, _ := itemDeleted(t, r.db, relayCart, "MILK"); deleted != 1 {
 			t.Fatalf("positive control: the add resurrected the row, so this case is not the one under test")
 		}
 		expect(t, "reservoir", r.events("g1"), "[1000]")
@@ -530,7 +530,7 @@ func TestStateRowCarriesTheCancelVerdict(t *testing.T) {
 		// A shape legacy rows take in production: unchecked, a purchased_at, and that act absent from the
 		// reservoir. Written directly, as a row the deployed relay left behind.
 		if _, err := r.db.Exec(`INSERT INTO items (id, cart_id, title, checked, purchased_at, ts)
-			VALUES ('legacy', ?, 'Soap', 0, 1000, 1000)`, relayCart); err != nil {
+			VALUES ('LEGACY', ?, 'Soap', 0, 1000, 1000)`, relayCart); err != nil {
 			t.Fatalf("seed legacy row: %v", err)
 		}
 		row := r.stateRow("legacy")

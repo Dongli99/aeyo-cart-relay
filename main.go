@@ -37,7 +37,7 @@ func main() {
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for range ticker.C {
-			pruneDeletedItems(db)
+			pruneExpired(db)
 		}
 	}()
 

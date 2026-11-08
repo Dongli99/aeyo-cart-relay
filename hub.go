@@ -71,6 +71,9 @@ type Client struct {
 	conn       *websocket.Conn
 	send       chan []byte
 	subscribed map[string]bool
+	// v is the protocol version this connection's latest subscription declared (absent = 1). Owned by the
+	// Hub like `subscribed`: a delta's fan-out reads it (ADR-101 §6).
+	v int
 
 	// Message budget, touched only by the read pump.
 	tokens    float64
@@ -111,13 +114,18 @@ func (h *Hub) Register(c *Client) {
 	}
 }
 
-// Subscribe REPLACES a client's subscription set with cartIDs and reindexes it.
+// Subscribe REPLACES a client's subscription set with cartIDs and reindexes it,
+// and records the protocol version v the subscription declared (absent = 1).
 // Returns the carts newly added by this call, so the caller can send a state
 // snapshot for those alone — a re-subscribe that only adds one cart must not
 // re-deliver every other cart's full state.
-func (h *Hub) Subscribe(c *Client, cartIDs []string) []string {
+func (h *Hub) Subscribe(c *Client, cartIDs []string, v int) []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if v == 0 {
+		v = 1
+	}
+	c.v = v
 
 	next := make(map[string]bool, len(cartIDs))
 	var added []string
@@ -215,12 +223,15 @@ func (h *Hub) Unregister(c *Client) {
 	h.mu.Unlock()
 }
 
-// BroadcastToCart sends msg to every client subscribed to cartID. A delta's fan-out is
-// BroadcastToCartExcludeUser's (ADR-098).
-func (h *Hub) BroadcastToCart(cartID string, msg []byte) {
+// broadcastWhere sends msg to every client subscribed to cartID that `to` admits. It is the one fan-out
+// loop; the named broadcasts below only say who hears.
+func (h *Hub) broadcastWhere(cartID string, msg []byte, to func(*Client) bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for c := range h.cartIndex[cartID] {
+		if !to(c) {
+			continue
+		}
 		select {
 		case c.send <- msg:
 		default:
@@ -230,21 +241,33 @@ func (h *Hub) BroadcastToCart(cartID string, msg []byte) {
 	}
 }
 
+// BroadcastToCart sends msg to every client subscribed to cartID.
+func (h *Hub) BroadcastToCart(cartID string, msg []byte) {
+	h.broadcastWhere(cartID, msg, func(*Client) bool { return true })
+}
+
 // BroadcastToCartExcludeUser sends msg to all clients subscribed to cartID except
 // those belonging to excludeUserID.
 func (h *Hub) BroadcastToCartExcludeUser(cartID string, msg []byte, excludeUserID string) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for c := range h.cartIndex[cartID] {
-		if c.userID == excludeUserID {
-			continue
-		}
-		select {
-		case c.send <- msg:
-		default:
-			log.Printf("hub: dropping message for slow client %s/%s", cartID, c.userID)
-		}
-	}
+	h.broadcastWhere(cartID, msg, func(c *Client) bool { return c.userID != excludeUserID })
+}
+
+// BroadcastDelta fans a relayed delta out from its sending connection (ADR-098 §1, ADR-101 §6). Every other
+// member's connections hear it. The sender's own account hears it on another connection only when that
+// connection's subscription declared protocol ownDeviceFanOut or later: a device declares it once it holds
+// one row per item, and below that CloudKit already carries a person's own writes between their devices,
+// so a second copy would be R-596's echo. The sending connection never hears its own delta. It is the
+// connection's user, not the op's actor, which may be the system sentinel.
+func (h *Hub) BroadcastDelta(cartID string, msg []byte, sender *Client) {
+	h.broadcastWhere(cartID, msg, func(c *Client) bool {
+		return c != sender && (c.userID != sender.userID || c.v >= ownDeviceFanOut)
+	})
+}
+
+// BroadcastToCartUser sends msg to userID's own clients subscribed to cartID, and nobody else's: what one
+// account alone may read, such as its final list (ADR-101 §4).
+func (h *Hub) BroadcastToCartUser(cartID string, msg []byte, userID string) {
+	h.broadcastWhere(cartID, msg, func(c *Client) bool { return c.userID == userID })
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +408,7 @@ func handleSubscribe(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 	}
 
 	_, accepted, rejected := verifySubscription(db, msg.Carts, c.userID)
-	added := h.Subscribe(c, accepted)
+	added := h.Subscribe(c, accepted, msg.V)
 
 	sendJSON(c, SubscribeResultMsg{
 		Type:     "subscribe_result",
@@ -417,9 +440,13 @@ func sendJSON(c *Client, v any) {
 
 // sendAck acknowledges a processed delta back to the originating connection
 // only (ADR-038 invariant B) — never broadcast. Non-blocking send: a lost ack
-// just means the client re-flushes an idempotent write later.
-func sendAck(c *Client, cartID, itemID string, ts float64, status string) {
+// just means the client re-flushes an idempotent write later. `out` carries the
+// row as it stands after the op (ADR-101 §2); a rejected op passes nil.
+func sendAck(c *Client, cartID, itemID string, ts float64, status string, out *OpOutcome) {
 	ack := AckMsg{Type: "ack", CartID: strings.ToLower(cartID), ItemID: itemID, Ts: ts, Status: status}
+	if out != nil {
+		ack.Item, ack.Tombstone = out.Item, out.Tombstone
+	}
 	b, err := json.Marshal(ack)
 	if err != nil {
 		return
@@ -436,6 +463,9 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 	if err := json.Unmarshal(rawMsg, &msg); err != nil {
 		return
 	}
+	for i := range msg.Ops {
+		msg.Ops[i].uppercaseIDs()
+	}
 
 	// F6: exactly one op per delta. handleDelta only ever persists Ops[0] but
 	// relays the whole message — a multi-op delta would diverge live peers from
@@ -447,7 +477,7 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 			itemID = msg.Ops[0].ID
 		}
 		log.Printf("handleDelta: rejecting %d-op delta (exactly 1 required) for %s", len(msg.Ops), c.userID)
-		sendAck(c, msg.CartID, itemID, msg.Ts, "rejected")
+		sendAck(c, msg.CartID, itemID, msg.Ts, "rejected", nil)
 		return
 	}
 	op := msg.Ops[0]
@@ -462,7 +492,7 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 	cartID := strings.ToLower(msg.CartID)
 	if !h.IsSubscribed(c, cartID) {
 		log.Printf("handleDelta: cart %s not subscribed on this connection (%s)", cartID, c.userID)
-		sendAck(c, msg.CartID, itemID, msg.Ts, "rejected")
+		sendAck(c, msg.CartID, itemID, msg.Ts, "rejected", nil)
 		return
 	}
 
@@ -471,13 +501,13 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 		actor = systemActor
 	}
 
-	out, err := ApplyOp(db, cartID, op.ID, op.Op, op.Fields, msg.Ts, msg.DeviceID, actor)
+	out, err := ApplyOp(db, cartID, op, msg.Ts, msg.DeviceID, actor)
 	if err != nil {
 		log.Printf("handleDelta: ApplyOp error: %v", err)
 		return
 	}
 	if !out.Applied {
-		sendAck(c, msg.CartID, op.ID, msg.Ts, "discarded")
+		sendAck(c, msg.CartID, op.ID, msg.Ts, "discarded", &out)
 		return
 	}
 
@@ -488,19 +518,25 @@ func handleDelta(c *Client, h *Hub, db *sql.DB, rawMsg []byte) {
 	// connection's authenticated userID.
 	if out.Broadcast {
 		msg.Ops[0].Fields = out.Fields
+		// The life rides a relayed add and a relayed delete, as the relay holds it (ADR-101 §1): an add's is
+		// the row's, and a delete's is the life it ended, whatever the client named. An update carries none.
+		msg.Ops[0].Marker, msg.Ops[0].Echo = "", ""
+		switch {
+		case op.Op == "add" && out.Item != nil:
+			msg.Ops[0].Marker, msg.Ops[0].Echo = out.Item.Marker, out.Item.Echo
+		case op.Op == "delete" && out.Tombstone != nil:
+			msg.Ops[0].Marker, msg.Ops[0].Echo = out.Tombstone.Marker, out.Tombstone.Echo
+		}
 		msg.UserID = actor
 		msg.CartID = cartID
 		relayed, err := json.Marshal(msg)
 		if err != nil {
 			return
 		}
-		// Per member, not per device (ADR-098): the sender's own account hears nothing of its own op on
-		// another device. CloudKit carries a person's data between their devices; the relay carries a shared
-		// cart between members. It is the connection's user, not the op's actor, which may be the system sentinel.
-		h.BroadcastToCartExcludeUser(cartID, relayed, c.userID)
+		h.BroadcastDelta(cartID, relayed, c)
 	}
 
-	sendAck(c, cartID, op.ID, msg.Ts, "applied")
+	sendAck(c, cartID, op.ID, msg.Ts, "applied", &out)
 
 	// A rescued older edit (ADR-096 §5): it won a key below the row clock, so every phone's per-item gate
 	// holds its delta. The cart's state carries the row's ts, which equals each member's item clock, and

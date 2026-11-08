@@ -119,7 +119,7 @@ func TestVerifySubscriptionRejectsPerCart(t *testing.T) {
 	db, cartA, cartB, keyAliceA, _, _ := subTestDB(t)
 
 	revokedCart := cartB
-	if err := RemoveMember(db, revokedCart, "alice"); err != nil {
+	if _, err := RemoveMember(db, revokedCart, "alice"); err != nil {
 		t.Fatalf("RemoveMember: %v", err)
 	}
 

@@ -26,10 +26,16 @@ func newTestClient(userID string) *Client {
 	}
 }
 
-// joinHub registers a client and subscribes it to cartIDs, the way wsHandler does.
+// joinHub registers a client and subscribes it to cartIDs at protocol 2, the way wsHandler does for
+// today's builds.
 func joinHub(h *Hub, c *Client, cartIDs ...string) *Client {
+	return joinHubAt(h, c, 2, cartIDs...)
+}
+
+// joinHubAt is joinHub with the protocol version the subscription declares.
+func joinHubAt(h *Hub, c *Client, v int, cartIDs ...string) *Client {
 	h.Register(c)
-	h.Subscribe(c, cartIDs)
+	h.Subscribe(c, cartIDs, v)
 	return c
 }
 
@@ -75,10 +81,10 @@ func TestHandleDeltaRejectsMultiOp(t *testing.T) {
 	if status, ok := drainAck(sender); !ok || status != "rejected" {
 		t.Errorf("sender ack: status=%q ok=%v, want \"rejected\"", status, ok)
 	}
-	if _, found := itemTitle(t, db, "cart-a", "item-1"); found {
+	if _, found := itemTitle(t, db, "cart-a", "ITEM-1"); found {
 		t.Errorf("item-1 must not be persisted from a rejected multi-op delta")
 	}
-	if _, found := itemTitle(t, db, "cart-a", "item-2"); found {
+	if _, found := itemTitle(t, db, "cart-a", "ITEM-2"); found {
 		t.Errorf("item-2 must not be persisted from a rejected multi-op delta")
 	}
 	if _, ok := drainAck(peer); ok {
@@ -110,7 +116,7 @@ func TestHandleDeltaSingleOpAppliesAndRelays(t *testing.T) {
 	})
 	handleDelta(sender, hub, db, raw)
 
-	if title, found := itemTitle(t, db, "cart-a", "item-1"); !found || title != "Milk" {
+	if title, found := itemTitle(t, db, "cart-a", "ITEM-1"); !found || title != "Milk" {
 		t.Errorf("item-1 must be persisted: found=%v title=%q", found, title)
 	}
 	if status, ok := drainAck(sender); !ok || status != "applied" {
@@ -165,10 +171,10 @@ func TestMultiplexedDeltaStaysInItsCart(t *testing.T) {
 	})
 	handleDelta(sender, hub, db, raw)
 
-	if title, found := itemTitle(t, db, "cart-b", "item-1"); !found || title != "Milk" {
+	if title, found := itemTitle(t, db, "cart-b", "ITEM-1"); !found || title != "Milk" {
 		t.Errorf("cart-b must hold the item: found=%v title=%q", found, title)
 	}
-	if _, found := itemTitle(t, db, "cart-a", "item-1"); found {
+	if _, found := itemTitle(t, db, "cart-a", "ITEM-1"); found {
 		t.Errorf("cart-a must not receive a write addressed to cart-b")
 	}
 	if status, ok := drainAck(sender); !ok || status != "applied" {
@@ -204,7 +210,7 @@ func TestDeltaForUnsubscribedCartIsRejected(t *testing.T) {
 	if status, ok := drainAck(sender); !ok || status != "rejected" {
 		t.Errorf("sender ack: status=%q ok=%v, want \"rejected\"", status, ok)
 	}
-	if _, found := itemTitle(t, db, "cart-b", "item-1"); found {
+	if _, found := itemTitle(t, db, "cart-b", "ITEM-1"); found {
 		t.Errorf("an unsubscribed cart must not be written")
 	}
 }
@@ -286,16 +292,16 @@ func TestSubscribeReportsOnlyNewCarts(t *testing.T) {
 	hub := NewHub()
 	c := joinHub(hub, newTestClient("user-a"), "cart-a")
 
-	added := hub.Subscribe(c, []string{"cart-a", "cart-b"})
+	added := hub.Subscribe(c, []string{"cart-a", "cart-b"}, 2)
 	if len(added) != 1 || added[0] != "cart-b" {
 		t.Errorf("Subscribe added = %v, want [cart-b]", added)
 	}
-	if hub.Subscribe(c, []string{"cart-a", "cart-b"}) != nil {
+	if hub.Subscribe(c, []string{"cart-a", "cart-b"}, 2) != nil {
 		t.Errorf("an unchanged re-subscribe must add nothing")
 	}
 
 	// Dropping a cart deindexes it as well as unsetting it.
-	hub.Subscribe(c, []string{"cart-b"})
+	hub.Subscribe(c, []string{"cart-b"}, 2)
 	if hub.IsSubscribed(c, "cart-a") {
 		t.Errorf("cart-a survived a replacing subscribe")
 	}
